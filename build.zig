@@ -9,13 +9,13 @@ const fs = std.fs;
 const InstallDirectoryOptions = std.Build.InstallDirectoryOptions;
 const assert = std.debug.assert;
 
-const zig_version: std.SemanticVersion = .{ .major = 0, .minor = 13, .patch = 0 };
+const zig_version: std.SemanticVersion = .{ .major = 0, .minor = 14, .patch = 0 };
 const stack_size = 32 * 1024 * 1024;
 
 pub fn build(b: *std.Build) !void {
     const only_c = b.option(bool, "only-c", "Translate the Zig compiler to C code, with only the C backend enabled") orelse false;
     const target = t: {
-        var default_target: std.zig.CrossTarget = .{};
+        var default_target: std.Target.Query = .{};
         default_target.ofmt = b.option(std.Target.ObjectFormat, "ofmt", "Object format to target") orelse if (only_c) .c else null;
         break :t b.standardTargetOptions(.{ .default_target = default_target });
     };
@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) !void {
     const check_case_exe = b.addExecutable(.{
         .name = "check-case",
         .root_source_file = b.path("test/src/Cases.zig"),
-        .target = b.host,
+        .target = b.graph.host,
         .optimize = optimize,
         .single_threaded = single_threaded,
     });
@@ -428,18 +428,21 @@ pub fn build(b: *std.Build) !void {
     }
     const optimization_modes = chosen_opt_modes_buf[0..chosen_mode_index];
 
-    const fmt_include_paths = &.{ "doc", "lib", "src", "test", "tools", "build.zig" };
+    const fmt_include_paths = &.{ "lib", "src", "test", "tools", "build.zig", "build.zig.zon" };
     const fmt_exclude_paths = &.{"test/cases"};
     const do_fmt = b.addFmt(.{
         .paths = fmt_include_paths,
         .exclude_paths = fmt_exclude_paths,
     });
+    b.step("fmt", "Modify source files in place to have conforming formatting").dependOn(&do_fmt.step);
 
-    b.step("test-fmt", "Check source files having conforming formatting").dependOn(&b.addFmt(.{
+    const check_fmt = b.step("test-fmt", "Check source files having conforming formatting");
+    check_fmt.dependOn(&b.addFmt(.{
         .paths = fmt_include_paths,
         .exclude_paths = fmt_exclude_paths,
         .check = true,
     }).step);
+    test_step.dependOn(check_fmt);
 
     const test_cases_step = b.step("test-cases", "Run the main compiler test cases");
     try tests.addCases(b, test_cases_step, test_filters, check_case_exe, target, .{
@@ -534,14 +537,11 @@ pub fn build(b: *std.Build) !void {
 
     try addWasiUpdateStep(b, version);
 
-    b.step("fmt", "Modify source files in place to have conforming formatting")
-        .dependOn(&do_fmt.step);
-
     const update_mingw_step = b.step("update-mingw", "Update zig's bundled mingw");
     const opt_mingw_src_path = b.option([]const u8, "mingw-src", "path to mingw-w64 source directory");
     const update_mingw_exe = b.addExecutable(.{
         .name = "update_mingw",
-        .target = b.host,
+        .target = b.graph.host,
         .root_source_file = b.path("tools/update_mingw.zig"),
     });
     const update_mingw_run = b.addRunArtifact(update_mingw_exe);
@@ -559,7 +559,7 @@ pub fn build(b: *std.Build) !void {
 fn addWasiUpdateStep(b: *std.Build, version: [:0]const u8) !void {
     const semver = try std.SemanticVersion.parse(version);
 
-    var target_query: std.zig.CrossTarget = .{
+    var target_query: std.Target.Query = .{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
     };
@@ -1259,7 +1259,7 @@ fn generateLangRef(b: *std.Build) std.Build.LazyPath {
     const doctest_exe = b.addExecutable(.{
         .name = "doctest",
         .root_source_file = b.path("tools/doctest.zig"),
-        .target = b.host,
+        .target = b.graph.host,
         .optimize = .Debug,
     });
 
@@ -1297,7 +1297,7 @@ fn generateLangRef(b: *std.Build) std.Build.LazyPath {
     const docgen_exe = b.addExecutable(.{
         .name = "docgen",
         .root_source_file = b.path("tools/docgen.zig"),
-        .target = b.host,
+        .target = b.graph.host,
         .optimize = .Debug,
     });
 

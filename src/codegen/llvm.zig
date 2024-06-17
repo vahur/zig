@@ -1732,6 +1732,7 @@ pub const Object = struct {
             .liveness = liveness,
             .dg = &dg,
             .wip = wip,
+            .is_naked = fn_info.cc == .Naked,
             .ret_ptr = ret_ptr,
             .args = args.items,
             .arg_index = 0,
@@ -1975,7 +1976,7 @@ pub const Object = struct {
                 defer gpa.free(dir_path);
                 if (std.fs.path.isAbsolute(dir_path))
                     break :dir_path try o.builder.metadataString(dir_path);
-                var abs_buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+                var abs_buffer: [std.fs.max_path_bytes]u8 = undefined;
                 const abs_path = std.fs.realpath(dir_path, &abs_buffer) catch
                     break :dir_path try o.builder.metadataString(dir_path);
                 break :dir_path try o.builder.metadataString(abs_path);
@@ -4801,6 +4802,7 @@ pub const FuncGen = struct {
     air: Air,
     liveness: Liveness,
     wip: Builder.WipFunction,
+    is_naked: bool,
 
     file: Builder.Metadata,
     scope: Builder.Metadata,
@@ -8846,7 +8848,8 @@ pub const FuncGen = struct {
         const arg_val = self.args[self.arg_index];
         self.arg_index += 1;
 
-        if (self.wip.strip) return arg_val;
+        // llvm does not support debug info for naked function arguments
+        if (self.wip.strip or self.is_naked) return arg_val;
 
         const inst_ty = self.typeOfIndex(inst);
         if (needDbgVarWorkaround(o)) return arg_val;
