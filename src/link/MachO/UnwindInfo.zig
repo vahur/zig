@@ -1,6 +1,6 @@
 /// List of all unwind records gathered from all objects and sorted
 /// by allocated relative function address within the section.
-records: std.ArrayListUnmanaged(Record.Ref) = .{},
+records: std.ArrayListUnmanaged(Record.Ref) = .empty,
 
 /// List of all personalities referenced by either unwind info entries
 /// or __eh_frame entries.
@@ -12,11 +12,11 @@ common_encodings: [max_common_encodings]Encoding = undefined,
 common_encodings_count: u7 = 0,
 
 /// List of record indexes containing an LSDA pointer.
-lsdas: std.ArrayListUnmanaged(u32) = .{},
-lsdas_lookup: std.ArrayListUnmanaged(u32) = .{},
+lsdas: std.ArrayListUnmanaged(u32) = .empty,
+lsdas_lookup: std.ArrayListUnmanaged(u32) = .empty,
 
 /// List of second level pages.
-pages: std.ArrayListUnmanaged(Page) = .{},
+pages: std.ArrayListUnmanaged(Page) = .empty,
 
 pub fn deinit(info: *UnwindInfo, allocator: Allocator) void {
     info.records.deinit(allocator);
@@ -53,7 +53,7 @@ pub fn generate(info: *UnwindInfo, macho_file: *MachO) !void {
     for (macho_file.sections.items(.atoms)) |atoms| {
         for (atoms.items) |ref| {
             const atom = ref.getAtom(macho_file) orelse continue;
-            if (!atom.flags.alive) continue;
+            if (!atom.isAlive()) continue;
             const recs = atom.getUnwindRecords(macho_file);
             const file = atom.getFile(macho_file);
             try info.records.ensureUnusedCapacity(gpa, recs.len);

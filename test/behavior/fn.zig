@@ -181,7 +181,6 @@ test "function with complex callconv and return type expressions" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     try expect(fComplexCallconvRet(3).x == 9);
 }
@@ -394,7 +393,7 @@ test "ability to give comptime types and non comptime types to same parameter" {
         }
 
         fn foo(arg: anytype) i32 {
-            if (@typeInfo(@TypeOf(arg)) == .Type and arg == i32) return 20;
+            if (@typeInfo(@TypeOf(arg)) == .type and arg == i32) return 20;
             return 9 + arg;
         }
     };
@@ -407,8 +406,8 @@ test "function with inferred error set but returning no error" {
         fn foo() !void {}
     };
 
-    const return_ty = @typeInfo(@TypeOf(S.foo)).Fn.return_type.?;
-    try expectEqual(0, @typeInfo(@typeInfo(return_ty).ErrorUnion.error_set).ErrorSet.?.len);
+    const return_ty = @typeInfo(@TypeOf(S.foo)).@"fn".return_type.?;
+    try expectEqual(0, @typeInfo(@typeInfo(return_ty).error_union.error_set).error_set.?.len);
 }
 
 test "import passed byref to function in return type" {
@@ -416,7 +415,7 @@ test "import passed byref to function in return type" {
 
     const S = struct {
         fn get() @import("std").ArrayListUnmanaged(i32) {
-            const x: @import("std").ArrayListUnmanaged(i32) = .{};
+            const x: @import("std").ArrayListUnmanaged(i32) = .empty;
             return x;
         }
     };
@@ -430,7 +429,6 @@ test "implicit cast function to function ptr" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64 and builtin.target.ofmt != .elf and builtin.target.ofmt != .macho) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     const S1 = struct {
         export fn someFunctionThatReturnsAValue() c_int {
@@ -451,7 +449,6 @@ test "implicit cast function to function ptr" {
 test "method call with optional and error union first param" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     const S = struct {
         x: i32 = 1234,
@@ -570,10 +567,10 @@ test "lazy values passed to anytype parameter" {
 
 test "pass and return comptime-only types" {
     const S = struct {
-        fn returnNull(comptime x: @Type(.Null)) @Type(.Null) {
+        fn returnNull(comptime x: @Type(.null)) @Type(.null) {
             return x;
         }
-        fn returnUndefined(comptime x: @Type(.Undefined)) @Type(.Undefined) {
+        fn returnUndefined(comptime x: @Type(.undefined)) @Type(.undefined) {
             return x;
         }
     };

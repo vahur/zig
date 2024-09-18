@@ -7,7 +7,7 @@ const assert = std.debug.assert;
 var foo: u8 align(4) = 100;
 
 test "global variable alignment" {
-    comptime assert(@typeInfo(@TypeOf(&foo)).Pointer.alignment == 4);
+    comptime assert(@typeInfo(@TypeOf(&foo)).pointer.alignment == 4);
     comptime assert(@TypeOf(&foo) == *align(4) u8);
     {
         const slice = @as(*align(4) [1]u8, &foo)[0..];
@@ -16,7 +16,6 @@ test "global variable alignment" {
 }
 
 test "large alignment of local constant" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest; // flaky
@@ -26,7 +25,6 @@ test "large alignment of local constant" {
 }
 
 test "slicing array of length 1 can not assume runtime index is always zero" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest; // flaky
@@ -94,11 +92,9 @@ test "alignment and size of structs with 128-bit fields" {
         .mipsel,
         .powerpc,
         .powerpcle,
-        .r600,
         .amdgcn,
         .riscv32,
         .sparc,
-        .sparcel,
         .s390x,
         .lanai,
         .wasm32,
@@ -178,7 +174,6 @@ test "alignment and size of structs with 128-bit fields" {
         .x86,
         .aarch64,
         .aarch64_be,
-        .aarch64_32,
         .riscv64,
         .bpfel,
         .bpfeb,
@@ -512,7 +507,6 @@ test "read 128-bit field from default aligned struct in global memory" {
 }
 
 test "struct field explicit alignment" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -588,10 +582,6 @@ test "comptime alloc alignment" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest; // flaky
-    if (builtin.zig_backend == .stage2_llvm and builtin.target.cpu.arch == .x86) {
-        // https://github.com/ziglang/zig/issues/18034
-        return error.SkipZigTest;
-    }
 
     comptime var bytes1 = [_]u8{0};
     _ = &bytes1;

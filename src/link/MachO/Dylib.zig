@@ -1,17 +1,21 @@
+/// Non-zero for fat dylibs
+offset: u64,
 path: []const u8,
 index: File.Index,
+file_handle: File.HandleIndex,
+tag: enum { dylib, tbd },
 
 exports: std.MultiArrayList(Export) = .{},
-strtab: std.ArrayListUnmanaged(u8) = .{},
+strtab: std.ArrayListUnmanaged(u8) = .empty,
 id: ?Id = null,
 ordinal: u16 = 0,
 
-symbols: std.ArrayListUnmanaged(Symbol) = .{},
-symbols_extra: std.ArrayListUnmanaged(u32) = .{},
-globals: std.ArrayListUnmanaged(MachO.SymbolResolver.Index) = .{},
-dependents: std.ArrayListUnmanaged(Id) = .{},
-rpaths: std.StringArrayHashMapUnmanaged(void) = .{},
-umbrella: File.Index = 0,
+symbols: std.ArrayListUnmanaged(Symbol) = .empty,
+symbols_extra: std.ArrayListUnmanaged(u32) = .empty,
+globals: std.ArrayListUnmanaged(MachO.SymbolResolver.Index) = .empty,
+dependents: std.ArrayListUnmanaged(Id) = .empty,
+rpaths: std.StringArrayHashMapUnmanaged(void) = .empty,
+umbrella: File.Index,
 platform: ?MachO.Platform = null,
 
 needed: bool,
@@ -22,16 +26,6 @@ hoisted: bool = true,
 referenced: bool = false,
 
 output_symtab_ctx: MachO.SymtabCtx = .{},
-
-pub fn isDylib(path: []const u8, fat_arch: ?fat.Arch) !bool {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    if (fat_arch) |arch| {
-        try file.seekTo(arch.offset);
-    }
-    const header = file.reader().readStruct(macho.mach_header_64) catch return false;
-    return header.filetype == macho.MH_DYLIB;
-}
 
 pub fn deinit(self: *Dylib, allocator: Allocator) void {
     allocator.free(self.path);
@@ -51,12 +45,21 @@ pub fn deinit(self: *Dylib, allocator: Allocator) void {
     self.rpaths.deinit(allocator);
 }
 
-pub fn parse(self: *Dylib, macho_file: *MachO, file: std.fs.File, fat_arch: ?fat.Arch) !void {
+pub fn parse(self: *Dylib, macho_file: *MachO) !void {
+    switch (self.tag) {
+        .tbd => try self.parseTbd(macho_file),
+        .dylib => try self.parseBinary(macho_file),
+    }
+    try self.initSymbols(macho_file);
+}
+
+fn parseBinary(self: *Dylib, macho_file: *MachO) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
     const gpa = macho_file.base.comp.gpa;
-    const offset = if (fat_arch) |ar| ar.offset else 0;
+    const file = macho_file.getFileHandle(self.file_handle);
+    const offset = self.offset;
 
     log.debug("parsing dylib from binary: {s}", .{self.path});
 
@@ -72,12 +75,12 @@ pub fn parse(self: *Dylib, macho_file: *MachO, file: std.fs.File, fat_arch: ?fat
         macho.CPU_TYPE_X86_64 => .x86_64,
         else => |x| {
             try macho_file.reportParseError2(self.index, "unknown cpu architecture: {d}", .{x});
-            return error.InvalidCpuArch;
+            return error.InvalidMachineType;
         },
     };
     if (macho_file.getTarget().cpu.arch != this_cpu_arch) {
         try macho_file.reportParseError2(self.index, "invalid cpu architecture: {s}", .{@tagName(this_cpu_arch)});
-        return error.InvalidCpuArch;
+        return error.InvalidMachineType;
     }
 
     const lc_buffer = try gpa.alloc(u8, header.sizeofcmds);
@@ -258,13 +261,7 @@ fn parseTrie(self: *Dylib, data: []const u8, macho_file: *MachO) !void {
     try self.parseTrieNode(&it, gpa, arena.allocator(), "");
 }
 
-pub fn parseTbd(
-    self: *Dylib,
-    cpu_arch: std.Target.Cpu.Arch,
-    platform: MachO.Platform,
-    lib_stub: LibStub,
-    macho_file: *MachO,
-) !void {
+fn parseTbd(self: *Dylib, macho_file: *MachO) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -272,6 +269,12 @@ pub fn parseTbd(
 
     log.debug("parsing dylib from stub: {s}", .{self.path});
 
+    const file = macho_file.getFileHandle(self.file_handle);
+    var lib_stub = LibStub.loadFromFile(gpa, file) catch |err| {
+        try macho_file.reportParseError2(self.index, "failed to parse TBD file: {s}", .{@errorName(err)});
+        return error.MalformedTbd;
+    };
+    defer lib_stub.deinit();
     const umbrella_lib = lib_stub.inner[0];
 
     {
@@ -290,7 +293,8 @@ pub fn parseTbd(
 
     log.debug("  (install_name '{s}')", .{umbrella_lib.installName()});
 
-    self.platform = platform;
+    const cpu_arch = macho_file.getTarget().cpu.arch;
+    self.platform = macho_file.platform;
 
     var matcher = try TargetMatcher.init(gpa, cpu_arch, self.platform.?.toApplePlatform());
     defer matcher.deinit();
@@ -495,7 +499,7 @@ fn addObjCExport(
     try self.addExport(allocator, full_name, .{});
 }
 
-pub fn initSymbols(self: *Dylib, macho_file: *MachO) !void {
+fn initSymbols(self: *Dylib, macho_file: *MachO) !void {
     const gpa = macho_file.base.comp.gpa;
 
     const nsyms = self.exports.items(.name).len;
@@ -609,15 +613,18 @@ pub inline fn getUmbrella(self: Dylib, macho_file: *MachO) *Dylib {
     return macho_file.getFile(self.umbrella).?.dylib;
 }
 
-fn addString(self: *Dylib, allocator: Allocator, name: []const u8) !u32 {
+fn addString(self: *Dylib, allocator: Allocator, name: []const u8) !MachO.String {
     const off = @as(u32, @intCast(self.strtab.items.len));
-    try self.strtab.writer(allocator).print("{s}\x00", .{name});
-    return off;
+    try self.strtab.ensureUnusedCapacity(allocator, name.len + 1);
+    self.strtab.appendSliceAssumeCapacity(name);
+    self.strtab.appendAssumeCapacity(0);
+    return .{ .pos = off, .len = @intCast(name.len + 1) };
 }
 
-pub fn getString(self: Dylib, off: u32) [:0]const u8 {
-    assert(off < self.strtab.items.len);
-    return mem.sliceTo(@as([*:0]const u8, @ptrCast(self.strtab.items.ptr + off)), 0);
+pub fn getString(self: Dylib, string: MachO.String) [:0]const u8 {
+    assert(string.pos < self.strtab.items.len and string.pos + string.len <= self.strtab.items.len);
+    if (string.len == 0) return "";
+    return self.strtab.items[string.pos..][0 .. string.len - 1 :0];
 }
 
 pub fn asFile(self: *Dylib) File {
@@ -643,14 +650,14 @@ pub fn getSymbolRef(self: Dylib, index: Symbol.Index, macho_file: *MachO) MachO.
 }
 
 pub fn addSymbolExtra(self: *Dylib, allocator: Allocator, extra: Symbol.Extra) !u32 {
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     try self.symbols_extra.ensureUnusedCapacity(allocator, fields.len);
     return self.addSymbolExtraAssumeCapacity(extra);
 }
 
 fn addSymbolExtraAssumeCapacity(self: *Dylib, extra: Symbol.Extra) u32 {
     const index = @as(u32, @intCast(self.symbols_extra.items.len));
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     inline for (fields) |field| {
         self.symbols_extra.appendAssumeCapacity(switch (field.type) {
             u32 => @field(extra, field.name),
@@ -661,7 +668,7 @@ fn addSymbolExtraAssumeCapacity(self: *Dylib, extra: Symbol.Extra) u32 {
 }
 
 pub fn getSymbolExtra(self: Dylib, index: u32) Symbol.Extra {
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     var i: usize = index;
     var result: Symbol.Extra = undefined;
     inline for (fields) |field| {
@@ -675,7 +682,7 @@ pub fn getSymbolExtra(self: Dylib, index: u32) Symbol.Extra {
 }
 
 pub fn setSymbolExtra(self: *Dylib, index: u32, extra: Symbol.Extra) void {
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     inline for (fields, 0..) |field, i| {
         self.symbols_extra.items[index + i] = switch (field.type) {
             u32 => @field(extra, field.name),
@@ -735,7 +742,7 @@ pub const TargetMatcher = struct {
     allocator: Allocator,
     cpu_arch: std.Target.Cpu.Arch,
     platform: macho.PLATFORM,
-    target_strings: std.ArrayListUnmanaged([]const u8) = .{},
+    target_strings: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(allocator: Allocator, cpu_arch: std.Target.Cpu.Arch, platform: macho.PLATFORM) !TargetMatcher {
         var self = TargetMatcher{
@@ -931,7 +938,7 @@ pub const Id = struct {
 };
 
 const Export = struct {
-    name: u32,
+    name: MachO.String,
     flags: Flags,
 
     const Flags = packed struct {

@@ -618,7 +618,6 @@ test "enum with specified tag values" {
 test "non-exhaustive enum" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     const S = struct {
         const E = enum(u8) { a, b, _ };
@@ -648,12 +647,12 @@ test "non-exhaustive enum" {
                 else => true,
             });
 
-            try expect(@typeInfo(E).Enum.fields.len == 2);
+            try expect(@typeInfo(E).@"enum".fields.len == 2);
             e = @as(E, @enumFromInt(12));
             try expect(@intFromEnum(e) == 12);
             e = @as(E, @enumFromInt(y));
             try expect(@intFromEnum(e) == 52);
-            try expect(@typeInfo(E).Enum.is_exhaustive == false);
+            try expect(@typeInfo(E).@"enum".is_exhaustive == false);
         }
     };
     try S.doTheTest(52);
@@ -672,8 +671,8 @@ test "empty non-exhaustive enum" {
             });
             try expect(@intFromEnum(e) == y);
 
-            try expect(@typeInfo(E).Enum.fields.len == 0);
-            try expect(@typeInfo(E).Enum.is_exhaustive == false);
+            try expect(@typeInfo(E).@"enum".fields.len == 0);
+            try expect(@typeInfo(E).@"enum".is_exhaustive == false);
         }
     };
     try S.doTheTest(42);
@@ -709,8 +708,8 @@ test "single field non-exhaustive enum" {
             });
 
             try expect(@intFromEnum(@as(E, @enumFromInt(y))) == y);
-            try expect(@typeInfo(E).Enum.fields.len == 1);
-            try expect(@typeInfo(E).Enum.is_exhaustive == false);
+            try expect(@typeInfo(E).@"enum".fields.len == 1);
+            try expect(@typeInfo(E).@"enum".is_exhaustive == false);
         }
     };
     try S.doTheTest(23);
@@ -934,7 +933,6 @@ const Bar = enum { A, B, C, D };
 test "enum literal casting to error union with payload enum" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     var bar: error{B}!Bar = undefined;
     bar = .B; // should never cast to the error set
@@ -1076,7 +1074,6 @@ test "enum literal casting to optional" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     var bar: ?Bar = undefined;
     bar = .B;
@@ -1105,7 +1102,6 @@ test "bit field access with enum fields" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     var data = bit_field_1;
     try expect(getA(&data) == A.Two);
@@ -1223,8 +1219,6 @@ test "enum tag from a local variable" {
 }
 
 test "auto-numbered enum with signed tag type" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-
     const E = enum(i32) { a, b };
 
     try std.testing.expectEqual(@as(i32, 0), @intFromEnum(E.a));
@@ -1259,9 +1253,9 @@ test "Non-exhaustive enum backed by comptime_int" {
 test "matching captures causes enum equivalence" {
     const S = struct {
         fn Nonexhaustive(comptime I: type) type {
-            const UTag = @Type(.{ .Int = .{
+            const UTag = @Type(.{ .int = .{
                 .signedness = .unsigned,
-                .bits = @typeInfo(I).Int.bits,
+                .bits = @typeInfo(I).int.bits,
             } });
             return enum(UTag) { _ };
         }

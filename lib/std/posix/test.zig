@@ -22,6 +22,15 @@ const tmpDir = std.testing.tmpDir;
 const Dir = std.fs.Dir;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
+// https://github.com/ziglang/zig/issues/20288
+test "WTF-8 to WTF-16 conversion buffer overflows" {
+    if (native_os != .windows) return error.SkipZigTest;
+
+    const input_wtf8 = "\u{10FFFF}" ** 16385;
+    try expectError(error.NameTooLong, posix.chdir(input_wtf8));
+    try expectError(error.NameTooLong, posix.chdirZ(input_wtf8));
+}
+
 test "chdir smoke test" {
     if (native_os == .wasi) return error.SkipZigTest;
 
@@ -269,7 +278,7 @@ test "link with relative paths" {
     cwd.deleteFile("new.txt") catch {};
 
     try cwd.writeFile(.{ .sub_path = "example.txt", .data = "example" });
-    try posix.link("example.txt", "new.txt", 0);
+    try posix.link("example.txt", "new.txt");
 
     const efd = try cwd.openFile("example.txt", .{});
     defer efd.close();
@@ -340,6 +349,7 @@ test "linkat with different directories" {
 }
 
 test "fstatat" {
+    if (builtin.cpu.arch == .riscv32 and builtin.os.tag == .linux and !builtin.link_libc) return error.SkipZigTest; // No `fstatat()`.
     // enable when `fstat` and `fstatat` are implemented on Windows
     if (native_os == .windows) return error.SkipZigTest;
 
@@ -571,11 +581,7 @@ test "memfd_create" {
         else => return error.SkipZigTest,
     }
 
-    const fd = posix.memfd_create("test", 0) catch |err| switch (err) {
-        // Related: https://github.com/ziglang/zig/issues/4019
-        error.SystemOutdated => return error.SkipZigTest,
-        else => |e| return e,
-    };
+    const fd = try posix.memfd_create("test", 0);
     defer posix.close(fd);
     try expect((try posix.write(fd, "test")) == 4);
     try posix.lseek_SET(fd, 0);
@@ -777,7 +783,7 @@ test "fsync" {
 test "getrlimit and setrlimit" {
     if (posix.system.rlimit_resource == void) return error.SkipZigTest;
 
-    inline for (@typeInfo(posix.rlimit_resource).Enum.fields) |field| {
+    inline for (@typeInfo(posix.rlimit_resource).@"enum".fields) |field| {
         const resource: posix.rlimit_resource = @enumFromInt(field.value);
         const limit = try posix.getrlimit(resource);
 
@@ -862,10 +868,10 @@ test "sigaction" {
     var old_sa: posix.Sigaction = undefined;
 
     // Install the new signal handler.
-    try posix.sigaction(posix.SIG.USR1, &sa, null);
+    posix.sigaction(posix.SIG.USR1, &sa, null);
 
     // Check that we can read it back correctly.
-    try posix.sigaction(posix.SIG.USR1, null, &old_sa);
+    posix.sigaction(posix.SIG.USR1, null, &old_sa);
     try testing.expectEqual(&S.handler, old_sa.handler.sigaction.?);
     try testing.expect((old_sa.flags & posix.SA.SIGINFO) != 0);
 
@@ -874,26 +880,26 @@ test "sigaction" {
     try testing.expect(S.handler_called_count == 1);
 
     // Check if passing RESETHAND correctly reset the handler to SIG_DFL
-    try posix.sigaction(posix.SIG.USR1, null, &old_sa);
+    posix.sigaction(posix.SIG.USR1, null, &old_sa);
     try testing.expectEqual(posix.SIG.DFL, old_sa.handler.handler);
 
     // Reinstall the signal w/o RESETHAND and re-raise
     sa.flags = posix.SA.SIGINFO;
-    try posix.sigaction(posix.SIG.USR1, &sa, null);
+    posix.sigaction(posix.SIG.USR1, &sa, null);
     try posix.raise(posix.SIG.USR1);
     try testing.expect(S.handler_called_count == 2);
 
     // Now set the signal to ignored
     sa.handler = .{ .handler = posix.SIG.IGN };
     sa.flags = 0;
-    try posix.sigaction(posix.SIG.USR1, &sa, null);
+    posix.sigaction(posix.SIG.USR1, &sa, null);
 
     // Re-raise to ensure handler is actually ignored
     try posix.raise(posix.SIG.USR1);
     try testing.expect(S.handler_called_count == 2);
 
     // Ensure that ignored state is returned when querying
-    try posix.sigaction(posix.SIG.USR1, null, &old_sa);
+    posix.sigaction(posix.SIG.USR1, null, &old_sa);
     try testing.expectEqual(posix.SIG.IGN, old_sa.handler.handler.?);
 }
 
@@ -1259,6 +1265,9 @@ test "fchmodat smoke test" {
         0o644,
     );
     posix.close(fd);
+
+    if (builtin.cpu.arch == .riscv32 and builtin.os.tag == .linux and !builtin.link_libc) return error.SkipZigTest; // No `fstatat()`.
+
     try posix.symlinkat("regfile", tmp.dir.fd, "symlink");
     const sym_mode = blk: {
         const st = try posix.fstatat(tmp.dir.fd, "symlink", posix.AT.SYMLINK_NOFOLLOW);

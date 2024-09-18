@@ -381,6 +381,7 @@ set(ZIG_STAGE2_SOURCES
     lib/std/Target/avr.zig
     lib/std/Target/bpf.zig
     lib/std/Target/hexagon.zig
+    lib/std/Target/loongarch.zig
     lib/std/Target/mips.zig
     lib/std/Target/msp430.zig
     lib/std/Target/nvptx.zig
@@ -535,11 +536,14 @@ set(ZIG_STAGE2_SOURCES
     src/arch/arm/Mir.zig
     src/arch/arm/abi.zig
     src/arch/arm/bits.zig
-    src/arch/riscv64/CodeGen.zig
-    src/arch/riscv64/Emit.zig
-    src/arch/riscv64/Mir.zig
     src/arch/riscv64/abi.zig
     src/arch/riscv64/bits.zig
+    src/arch/riscv64/CodeGen.zig
+    src/arch/riscv64/Emit.zig
+    src/arch/riscv64/encoding.zig
+    src/arch/riscv64/Lower.zig
+    src/arch/riscv64/Mir.zig
+    src/arch/riscv64/mnem.zig
     src/arch/sparc64/CodeGen.zig
     src/arch/sparc64/Emit.zig
     src/arch/sparc64/Mir.zig
@@ -596,6 +600,7 @@ set(ZIG_STAGE2_SOURCES
     src/link/Elf.zig
     src/link/Elf/Archive.zig
     src/link/Elf/Atom.zig
+    src/link/Elf/AtomList.zig
     src/link/Elf/LdScript.zig
     src/link/Elf/LinkerDefined.zig
     src/link/Elf/Object.zig
@@ -609,7 +614,7 @@ set(ZIG_STAGE2_SOURCES
     src/link/Elf/relocatable.zig
     src/link/Elf/relocation.zig
     src/link/Elf/synthetic_sections.zig
-    src/link/Elf/thunks.zig
+    src/link/Elf/Thunk.zig
     src/link/MachO.zig
     src/link/MachO/Archive.zig
     src/link/MachO/Atom.zig
@@ -634,7 +639,7 @@ set(ZIG_STAGE2_SOURCES
     src/link/MachO/load_commands.zig
     src/link/MachO/relocatable.zig
     src/link/MachO/synthetic.zig
-    src/link/MachO/thunks.zig
+    src/link/MachO/Thunk.zig
     src/link/MachO/uuid.zig
     src/link/NvPtx.zig
     src/link/Plan9.zig
@@ -865,9 +870,9 @@ set(BUILD_ZIG2_ARGS
   -target "${ZIG_HOST_TARGET_TRIPLE}"
   --dep "build_options"
   --dep "aro"
-  --mod "root" "src/main.zig"
-  --mod "build_options" "${ZIG_CONFIG_ZIG_OUT}"
-  --mod "aro" "lib/compiler/aro/aro.zig"
+  "-Mroot=src/main.zig"
+  "-Mbuild_options=${ZIG_CONFIG_ZIG_OUT}"
+  "-Maro=lib/compiler/aro/aro.zig"
 )
 
 add_custom_command(
@@ -885,8 +890,8 @@ set(BUILD_COMPILER_RT_ARGS
   -femit-bin="${ZIG_COMPILER_RT_C_SOURCE}"
   -target "${ZIG_HOST_TARGET_TRIPLE}"
   --dep "build_options"
-  --mod "root" "lib/compiler_rt.zig"
-  --mod "build_options" "${ZIG_CONFIG_ZIG_OUT}"
+  "-Mroot=lib/compiler_rt.zig"
+  "-Mbuild_options=${ZIG_CONFIG_ZIG_OUT}"
 )
 
 add_custom_command(
@@ -941,6 +946,11 @@ set(ZIG_BUILD_ARGS
 
   -Dno-langref
 )
+
+option(ZIG_EXTRA_BUILD_ARGS "Extra zig build args")
+if(ZIG_EXTRA_BUILD_ARGS)
+  list(APPEND ZIG_BUILD_ARGS ${ZIG_EXTRA_BUILD_ARGS})
+endif()
 
 if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
   list(APPEND ZIG_BUILD_ARGS -Doptimize=Debug)

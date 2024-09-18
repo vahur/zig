@@ -51,7 +51,7 @@ start: ?u32 = null,
 features: []const types.Feature = &.{},
 /// A table that maps the relocations we must perform where the key represents
 /// the section that the list of relocations applies to.
-relocations: std.AutoArrayHashMapUnmanaged(u32, []types.Relocation) = .{},
+relocations: std.AutoArrayHashMapUnmanaged(u32, []types.Relocation) = .empty,
 /// Table of symbols belonging to this Object file
 symtable: []Symbol = &.{},
 /// Extra metadata about the linking section, such as alignment of segments and their name
@@ -62,7 +62,7 @@ init_funcs: []const types.InitFunc = &.{},
 comdat_info: []const types.Comdat = &.{},
 /// Represents non-synthetic sections that can essentially be mem-cpy'd into place
 /// after performing relocations.
-relocatable_data: std.AutoHashMapUnmanaged(RelocatableData.Tag, []RelocatableData) = .{},
+relocatable_data: std.AutoHashMapUnmanaged(RelocatableData.Tag, []RelocatableData) = .empty,
 /// String table for all strings required by the object file, such as symbol names,
 /// import name, module name and export names. Each string will be deduplicated
 /// and returns an offset into the table.
@@ -220,7 +220,7 @@ pub fn findImport(object: *const Object, sym: Symbol) types.Import {
 }
 
 /// Checks if the object file is an MVP version.
-/// When that's the case, we check if there's an import table definiton with its name
+/// When that's the case, we check if there's an import table definition with its name
 /// set to '__indirect_function_table". When that's also the case,
 /// we initialize a new table symbol that corresponds to that import and return that symbol.
 ///
@@ -235,27 +235,27 @@ fn checkLegacyIndirectFunctionTable(object: *Object, wasm_file: *const Wasm) !?S
     if (object.imported_tables_count == table_count) return null;
 
     if (table_count != 0) {
-        var err = try wasm_file.addErrorWithNotes(1);
-        try err.addMsg(wasm_file, "Expected a table entry symbol for each of the {d} table(s), but instead got {d} symbols.", .{
+        var err = try wasm_file.base.addErrorWithNotes(1);
+        try err.addMsg("Expected a table entry symbol for each of the {d} table(s), but instead got {d} symbols.", .{
             object.imported_tables_count,
             table_count,
         });
-        try err.addNote(wasm_file, "defined in '{s}'", .{object.path});
+        try err.addNote("defined in '{s}'", .{object.path});
         return error.MissingTableSymbols;
     }
 
     // MVP object files cannot have any table definitions, only imports (for the indirect function table).
     if (object.tables.len > 0) {
-        var err = try wasm_file.addErrorWithNotes(1);
-        try err.addMsg(wasm_file, "Unexpected table definition without representing table symbols.", .{});
-        try err.addNote(wasm_file, "defined in '{s}'", .{object.path});
+        var err = try wasm_file.base.addErrorWithNotes(1);
+        try err.addMsg("Unexpected table definition without representing table symbols.", .{});
+        try err.addNote("defined in '{s}'", .{object.path});
         return error.UnexpectedTable;
     }
 
     if (object.imported_tables_count != 1) {
-        var err = try wasm_file.addErrorWithNotes(1);
-        try err.addMsg(wasm_file, "Found more than one table import, but no representing table symbols", .{});
-        try err.addNote(wasm_file, "defined in '{s}'", .{object.path});
+        var err = try wasm_file.base.addErrorWithNotes(1);
+        try err.addMsg("Found more than one table import, but no representing table symbols", .{});
+        try err.addNote("defined in '{s}'", .{object.path});
         return error.MissingTableSymbols;
     }
 
@@ -266,9 +266,9 @@ fn checkLegacyIndirectFunctionTable(object: *Object, wasm_file: *const Wasm) !?S
     } else unreachable;
 
     if (!std.mem.eql(u8, object.string_table.get(table_import.name), "__indirect_function_table")) {
-        var err = try wasm_file.addErrorWithNotes(1);
-        try err.addMsg(wasm_file, "Non-indirect function table import '{s}' is missing a corresponding symbol", .{object.string_table.get(table_import.name)});
-        try err.addNote(wasm_file, "defined in '{s}'", .{object.path});
+        var err = try wasm_file.base.addErrorWithNotes(1);
+        try err.addMsg("Non-indirect function table import '{s}' is missing a corresponding symbol", .{object.string_table.get(table_import.name)});
+        try err.addNote("defined in '{s}'", .{object.path});
         return error.MissingTableSymbols;
     }
 
@@ -315,7 +315,7 @@ pub const ParseError = error{
     Overflow,
     /// Found table definitions but no corresponding table symbols
     MissingTableSymbols,
-    /// Did not expect a table definiton, but did find one
+    /// Did not expect a table definition, but did find one
     UnexpectedTable,
     /// Object file contains a feature that is unknown to the linker
     UnknownFeature,
@@ -379,7 +379,7 @@ fn Parser(comptime ReaderType: type) type {
                             try parser.parseFeatures(gpa);
                         } else if (std.mem.startsWith(u8, name, ".debug")) {
                             const gop = try parser.object.relocatable_data.getOrPut(gpa, .custom);
-                            var relocatable_data: std.ArrayListUnmanaged(RelocatableData) = .{};
+                            var relocatable_data: std.ArrayListUnmanaged(RelocatableData) = .empty;
                             defer relocatable_data.deinit(gpa);
                             if (!gop.found_existing) {
                                 gop.value_ptr.* = &.{};
@@ -596,9 +596,9 @@ fn Parser(comptime ReaderType: type) type {
                 try reader.readNoEof(name);
 
                 const tag = types.known_features.get(name) orelse {
-                    var err = try parser.wasm_file.addErrorWithNotes(1);
-                    try err.addMsg(parser.wasm_file, "Object file contains unknown feature: {s}", .{name});
-                    try err.addNote(parser.wasm_file, "defined in '{s}'", .{parser.object.path});
+                    var err = try parser.wasm_file.base.addErrorWithNotes(1);
+                    try err.addMsg("Object file contains unknown feature: {s}", .{name});
+                    try err.addNote("defined in '{s}'", .{parser.object.path});
                     return error.UnknownFeature;
                 };
                 feature.* = .{
@@ -871,7 +871,7 @@ fn ElementType(comptime ptr: type) type {
 /// signedness of the given type `T`.
 /// Asserts `T` is an integer.
 fn readLeb(comptime T: type, reader: anytype) !T {
-    return switch (@typeInfo(T).Int.signedness) {
+    return switch (@typeInfo(T).int.signedness) {
         .signed => try leb.readIleb128(T, reader),
         .unsigned => try leb.readUleb128(T, reader),
     };
@@ -881,7 +881,7 @@ fn readLeb(comptime T: type, reader: anytype) !T {
 /// Asserts `T` is an enum
 fn readEnum(comptime T: type, reader: anytype) !T {
     switch (@typeInfo(T)) {
-        .Enum => |enum_type| return @as(T, @enumFromInt(try readLeb(enum_type.tag_type, reader))),
+        .@"enum" => |enum_type| return @as(T, @enumFromInt(try readLeb(enum_type.tag_type, reader))),
         else => @compileError("T must be an enum. Instead was given type " ++ @typeName(T)),
     }
 }

@@ -9,27 +9,27 @@ in_archive: ?InArchive = null,
 header: ?macho.mach_header_64 = null,
 sections: std.MultiArrayList(Section) = .{},
 symtab: std.MultiArrayList(Nlist) = .{},
-strtab: std.ArrayListUnmanaged(u8) = .{},
+strtab: std.ArrayListUnmanaged(u8) = .empty,
 
-symbols: std.ArrayListUnmanaged(Symbol) = .{},
-symbols_extra: std.ArrayListUnmanaged(u32) = .{},
-globals: std.ArrayListUnmanaged(MachO.SymbolResolver.Index) = .{},
-atoms: std.ArrayListUnmanaged(Atom) = .{},
-atoms_indexes: std.ArrayListUnmanaged(Atom.Index) = .{},
-atoms_extra: std.ArrayListUnmanaged(u32) = .{},
+symbols: std.ArrayListUnmanaged(Symbol) = .empty,
+symbols_extra: std.ArrayListUnmanaged(u32) = .empty,
+globals: std.ArrayListUnmanaged(MachO.SymbolResolver.Index) = .empty,
+atoms: std.ArrayListUnmanaged(Atom) = .empty,
+atoms_indexes: std.ArrayListUnmanaged(Atom.Index) = .empty,
+atoms_extra: std.ArrayListUnmanaged(u32) = .empty,
 
 platform: ?MachO.Platform = null,
 compile_unit: ?CompileUnit = null,
-stab_files: std.ArrayListUnmanaged(StabFile) = .{},
+stab_files: std.ArrayListUnmanaged(StabFile) = .empty,
 
 eh_frame_sect_index: ?u8 = null,
 compact_unwind_sect_index: ?u8 = null,
-cies: std.ArrayListUnmanaged(Cie) = .{},
-fdes: std.ArrayListUnmanaged(Fde) = .{},
-eh_frame_data: std.ArrayListUnmanaged(u8) = .{},
-unwind_records: std.ArrayListUnmanaged(UnwindInfo.Record) = .{},
-unwind_records_indexes: std.ArrayListUnmanaged(UnwindInfo.Record.Index) = .{},
-data_in_code: std.ArrayListUnmanaged(macho.data_in_code_entry) = .{},
+cies: std.ArrayListUnmanaged(Cie) = .empty,
+fdes: std.ArrayListUnmanaged(Fde) = .empty,
+eh_frame_data: std.ArrayListUnmanaged(u8) = .empty,
+unwind_records: std.ArrayListUnmanaged(UnwindInfo.Record) = .empty,
+unwind_records_indexes: std.ArrayListUnmanaged(UnwindInfo.Record.Index) = .empty,
+data_in_code: std.ArrayListUnmanaged(macho.data_in_code_entry) = .empty,
 
 alive: bool = true,
 hidden: bool = false,
@@ -37,13 +37,6 @@ hidden: bool = false,
 compact_unwind_ctx: CompactUnwindCtx = .{},
 output_symtab_ctx: MachO.SymtabCtx = .{},
 output_ar_state: Archive.ArState = .{},
-
-pub fn isObject(path: []const u8) !bool {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const header = file.reader().readStruct(macho.mach_header_64) catch return false;
-    return header.filetype == macho.MH_OBJECT;
-}
 
 pub fn deinit(self: *Object, allocator: Allocator) void {
     if (self.in_archive) |*ar| allocator.free(ar.path);
@@ -98,12 +91,12 @@ pub fn parse(self: *Object, macho_file: *MachO) !void {
         macho.CPU_TYPE_X86_64 => .x86_64,
         else => |x| {
             try macho_file.reportParseError2(self.index, "unknown cpu architecture: {d}", .{x});
-            return error.InvalidCpuArch;
+            return error.InvalidMachineType;
         },
     };
     if (cpu_arch != this_cpu_arch) {
         try macho_file.reportParseError2(self.index, "invalid cpu architecture: {s}", .{@tagName(this_cpu_arch)});
-        return error.InvalidCpuArch;
+        return error.InvalidMachineType;
     }
 
     const lc_buffer = try gpa.alloc(u8, self.header.?.sizeofcmds);
@@ -185,7 +178,7 @@ pub fn parse(self: *Object, macho_file: *MachO) !void {
 
         fn rank(ctx: *const Object, nl: macho.nlist_64) u8 {
             if (!nl.ext()) {
-                const name = ctx.getString(nl.n_strx);
+                const name = ctx.getNStrx(nl.n_strx);
                 if (name.len == 0) return 5;
                 if (name[0] == 'l' or name[0] == 'L') return 4;
                 return 3;
@@ -270,9 +263,12 @@ pub fn parse(self: *Object, macho_file: *MachO) !void {
             mem.eql(u8, isec.sectName(), "__compact_unwind") or
             isec.attrs() & macho.S_ATTR_DEBUG != 0)
         {
-            atom.flags.alive = false;
+            atom.setAlive(false);
         }
     }
+
+    // Finally, we do a post-parse check for -ObjC to see if we need to force load this member anyhow.
+    self.alive = self.alive or (macho_file.force_load_objc and self.hasObjC());
 }
 
 pub fn isCstringLiteral(sect: macho.section_64) bool {
@@ -345,7 +341,7 @@ fn initSubsections(self: *Object, allocator: Allocator, nlists: anytype) !void {
             else
                 sect.@"align";
             const atom_index = try self.addAtom(allocator, .{
-                .name = nlist.nlist.n_strx,
+                .name = .{ .pos = nlist.nlist.n_strx, .len = @intCast(self.getNStrx(nlist.nlist.n_strx).len + 1) },
                 .n_sect = @intCast(n_sect),
                 .off = nlist.nlist.n_value - sect.addr,
                 .size = size,
@@ -469,7 +465,7 @@ fn initCstringLiterals(self: *Object, allocator: Allocator, file: File.Handle, m
             const nlist_index: u32 = @intCast(try self.symtab.addOne(allocator));
             self.symtab.set(nlist_index, .{
                 .nlist = .{
-                    .n_strx = name_str,
+                    .n_strx = name_str.pos,
                     .n_type = macho.N_SECT,
                     .n_sect = @intCast(atom.n_sect + 1),
                     .n_desc = 0,
@@ -536,7 +532,7 @@ fn initFixedSizeLiterals(self: *Object, allocator: Allocator, macho_file: *MachO
             const nlist_index: u32 = @intCast(try self.symtab.addOne(allocator));
             self.symtab.set(nlist_index, .{
                 .nlist = .{
-                    .n_strx = name_str,
+                    .n_strx = name_str.pos,
                     .n_type = macho.N_SECT,
                     .n_sect = @intCast(atom.n_sect + 1),
                     .n_desc = 0,
@@ -594,7 +590,7 @@ fn initPointerLiterals(self: *Object, allocator: Allocator, macho_file: *MachO) 
             const nlist_index: u32 = @intCast(try self.symtab.addOne(allocator));
             self.symtab.set(nlist_index, .{
                 .nlist = .{
-                    .n_strx = name_str,
+                    .n_strx = name_str.pos,
                     .n_type = macho.N_SECT,
                     .n_sect = @intCast(atom.n_sect + 1),
                     .n_desc = 0,
@@ -649,7 +645,7 @@ pub fn resolveLiterals(self: *Object, lp: *MachO.LiteralPool, macho_file: *MachO
                     const lp_sym = lp.getSymbol(res.index, macho_file);
                     const lp_atom = lp_sym.getAtom(macho_file).?;
                     lp_atom.alignment = lp_atom.alignment.max(atom.alignment);
-                    atom.flags.alive = false;
+                    atom.setAlive(false);
                 }
                 atom.addExtra(.{ .literal_pool_index = res.index }, macho_file);
             }
@@ -687,7 +683,7 @@ pub fn resolveLiterals(self: *Object, lp: *MachO.LiteralPool, macho_file: *MachO
                     const lp_sym = lp.getSymbol(res.index, macho_file);
                     const lp_atom = lp_sym.getAtom(macho_file).?;
                     lp_atom.alignment = lp_atom.alignment.max(atom.alignment);
-                    atom.flags.alive = false;
+                    atom.setAlive(false);
                 }
                 atom.addExtra(.{ .literal_pool_index = res.index }, macho_file);
             }
@@ -701,7 +697,7 @@ pub fn dedupLiterals(self: *Object, lp: MachO.LiteralPool, macho_file: *MachO) v
 
     for (self.getAtoms()) |atom_index| {
         const atom = self.getAtom(atom_index) orelse continue;
-        if (!atom.flags.alive) continue;
+        if (!atom.isAlive()) continue;
 
         const relocs = blk: {
             const extra = atom.getExtra(macho_file);
@@ -800,7 +796,7 @@ fn linkNlistToAtom(self: *Object, macho_file: *MachO) !void {
                 atom.* = atom_index;
             } else {
                 try macho_file.reportParseError2(self.index, "symbol {s} not attached to any (sub)section", .{
-                    self.getString(nlist.n_strx),
+                    self.getNStrx(nlist.n_strx),
                 });
                 return error.MalformedObject;
             }
@@ -825,7 +821,7 @@ fn initSymbols(self: *Object, allocator: Allocator, macho_file: *MachO) !void {
         const index = self.addSymbolAssumeCapacity();
         const symbol = &self.symbols.items[index];
         symbol.value = nlist.n_value;
-        symbol.name = nlist.n_strx;
+        symbol.name = .{ .pos = nlist.n_strx, .len = @intCast(self.getNStrx(nlist.n_strx).len + 1) };
         symbol.nlist_idx = @intCast(i);
         symbol.extra = self.addSymbolExtraAssumeCapacity(.{});
 
@@ -898,7 +894,7 @@ fn initSymbolStabs(self: *Object, allocator: Allocator, nlists: anytype, macho_f
     defer addr_lookup.deinit();
     for (syms) |sym| {
         if (sym.sect() and (sym.ext() or sym.pext())) {
-            try addr_lookup.putNoClobber(self.getString(sym.n_strx), sym.n_value);
+            try addr_lookup.putNoClobber(self.getNStrx(sym.n_strx), sym.n_value);
         }
     }
 
@@ -930,7 +926,7 @@ fn initSymbolStabs(self: *Object, allocator: Allocator, nlists: anytype, macho_f
                 },
                 macho.N_GSYM => {
                     stab.is_func = false;
-                    stab.index = sym_lookup.find(addr_lookup.get(self.getString(nlist.n_strx)).?);
+                    stab.index = sym_lookup.find(addr_lookup.get(self.getNStrx(nlist.n_strx)).?);
                 },
                 macho.N_STSYM => {
                     stab.is_func = false;
@@ -994,7 +990,7 @@ fn initRelocs(self: *Object, file: File.Handle, cpu_arch: std.Target.Cpu.Arch, m
         var next_reloc: u32 = 0;
         for (subsections.items) |subsection| {
             const atom = self.getAtom(subsection.atom).?;
-            if (!atom.flags.alive) continue;
+            if (!atom.isAlive()) continue;
             if (next_reloc >= relocs.items.len) break;
             const end_addr = atom.off + atom.size;
             const rel_index = next_reloc;
@@ -1487,7 +1483,7 @@ pub fn resolveSymbols(self: *Object, macho_file: *MachO) !void {
         if (!nlist.ext()) continue;
         if (nlist.sect()) {
             const atom = self.getAtom(atom_index).?;
-            if (!atom.flags.alive) continue;
+            if (!atom.isAlive()) continue;
         }
 
         const gop = try macho_file.resolver.getOrPut(gpa, .{
@@ -1556,7 +1552,7 @@ pub fn scanRelocs(self: *Object, macho_file: *MachO) !void {
 
     for (self.getAtoms()) |atom_index| {
         const atom = self.getAtom(atom_index) orelse continue;
-        if (!atom.flags.alive) continue;
+        if (!atom.isAlive()) continue;
         const sect = atom.getInputSection(macho_file);
         if (sect.isZerofill()) continue;
         try atom.scanRelocs(macho_file);
@@ -1567,10 +1563,10 @@ pub fn scanRelocs(self: *Object, macho_file: *MachO) !void {
         if (!rec.alive) continue;
         if (rec.getFde(macho_file)) |fde| {
             if (fde.getCie(macho_file).getPersonality(macho_file)) |sym| {
-                sym.flags.needs_got = true;
+                sym.setSectionFlags(.{ .needs_got = true });
             }
         } else if (rec.getPersonality(macho_file)) |sym| {
-            sym.flags.needs_got = true;
+            sym.setSectionFlags(.{ .needs_got = true });
         }
     }
 }
@@ -1652,12 +1648,12 @@ pub fn parseAr(self: *Object, macho_file: *MachO) !void {
         macho.CPU_TYPE_X86_64 => .x86_64,
         else => |x| {
             try macho_file.reportParseError2(self.index, "unknown cpu architecture: {d}", .{x});
-            return error.InvalidCpuArch;
+            return error.InvalidMachineType;
         },
     };
     if (macho_file.getTarget().cpu.arch != this_cpu_arch) {
         try macho_file.reportParseError2(self.index, "invalid cpu architecture: {s}", .{@tagName(this_cpu_arch)});
-        return error.InvalidCpuArch;
+        return error.InvalidMachineType;
     }
 
     const lc_buffer = try gpa.alloc(u8, self.header.?.sizeofcmds);
@@ -1712,7 +1708,7 @@ pub fn updateArSymtab(self: Object, ar_symtab: *Archive.ArSymtab, macho_file: *M
     const gpa = macho_file.base.comp.gpa;
     for (self.symtab.items(.nlist)) |nlist| {
         if (!nlist.ext() or (nlist.undf() and !nlist.tentative())) continue;
-        const off = try ar_symtab.strtab.insert(gpa, self.getString(nlist.n_strx));
+        const off = try ar_symtab.strtab.insert(gpa, self.getNStrx(nlist.n_strx));
         try ar_symtab.entries.append(gpa, .{ .off = off, .file = self.index });
     }
 }
@@ -1749,7 +1745,7 @@ pub fn calcSymtabSize(self: *Object, macho_file: *MachO) void {
         const ref = self.getSymbolRef(@intCast(i), macho_file);
         const file = ref.getFile(macho_file) orelse continue;
         if (file.getIndex() != self.index) continue;
-        if (sym.getAtom(macho_file)) |atom| if (!atom.flags.alive) continue;
+        if (sym.getAtom(macho_file)) |atom| if (!atom.isAlive()) continue;
         if (sym.isSymbolStab(macho_file)) continue;
         const name = sym.getName(macho_file);
         if (name.len == 0) continue;
@@ -1858,7 +1854,7 @@ pub fn writeAtoms(self: *Object, macho_file: *MachO) !void {
     }
     for (self.getAtoms()) |atom_index| {
         const atom = self.getAtom(atom_index) orelse continue;
-        if (!atom.flags.alive) continue;
+        if (!atom.isAlive()) continue;
         const sect = atom.getInputSection(macho_file);
         if (sect.isZerofill()) continue;
         const value = math.cast(usize, atom.value) orelse return error.Overflow;
@@ -1897,7 +1893,7 @@ pub fn writeAtomsRelocatable(self: *Object, macho_file: *MachO) !void {
     }
     for (self.getAtoms()) |atom_index| {
         const atom = self.getAtom(atom_index) orelse continue;
-        if (!atom.flags.alive) continue;
+        if (!atom.isAlive()) continue;
         const sect = atom.getInputSection(macho_file);
         if (sect.isZerofill()) continue;
         const value = math.cast(usize, atom.value) orelse return error.Overflow;
@@ -2296,17 +2292,23 @@ pub fn getAtomRelocs(self: *const Object, atom: Atom, macho_file: *MachO) []cons
     return relocs.items[extra.rel_index..][0..extra.rel_count];
 }
 
-fn addString(self: *Object, allocator: Allocator, name: [:0]const u8) error{OutOfMemory}!u32 {
+fn addString(self: *Object, allocator: Allocator, string: [:0]const u8) error{OutOfMemory}!MachO.String {
     const off: u32 = @intCast(self.strtab.items.len);
-    try self.strtab.ensureUnusedCapacity(allocator, name.len + 1);
-    self.strtab.appendSliceAssumeCapacity(name);
+    try self.strtab.ensureUnusedCapacity(allocator, string.len + 1);
+    self.strtab.appendSliceAssumeCapacity(string);
     self.strtab.appendAssumeCapacity(0);
-    return off;
+    return .{ .pos = off, .len = @intCast(string.len + 1) };
 }
 
-pub fn getString(self: Object, off: u32) [:0]const u8 {
-    assert(off < self.strtab.items.len);
-    return mem.sliceTo(@as([*:0]const u8, @ptrCast(self.strtab.items.ptr + off)), 0);
+pub fn getString(self: Object, string: MachO.String) [:0]const u8 {
+    assert(string.pos < self.strtab.items.len and string.pos + string.len <= self.strtab.items.len);
+    if (string.len == 0) return "";
+    return self.strtab.items[string.pos..][0 .. string.len - 1 :0];
+}
+
+fn getNStrx(self: Object, n_strx: u32) [:0]const u8 {
+    assert(n_strx < self.strtab.items.len);
+    return mem.sliceTo(@as([*:0]const u8, @ptrCast(self.strtab.items.ptr + n_strx)), 0);
 }
 
 pub fn hasUnwindRecords(self: Object) bool {
@@ -2325,9 +2327,9 @@ fn hasSymbolStabs(self: Object) bool {
     return self.stab_files.items.len > 0;
 }
 
-pub fn hasObjc(self: Object) bool {
+fn hasObjC(self: Object) bool {
     for (self.symtab.items(.nlist)) |nlist| {
-        const name = self.getString(nlist.n_strx);
+        const name = self.getNStrx(nlist.n_strx);
         if (mem.startsWith(u8, name, "_OBJC_CLASS_$_")) return true;
     }
     for (self.sections.items(.header)) |sect| {
@@ -2350,7 +2352,7 @@ pub fn asFile(self: *Object) File {
 }
 
 const AddAtomArgs = struct {
-    name: u32,
+    name: MachO.String,
     n_sect: u8,
     off: u64,
     size: u64,
@@ -2384,14 +2386,14 @@ pub fn getAtoms(self: *Object) []const Atom.Index {
 }
 
 fn addAtomExtra(self: *Object, allocator: Allocator, extra: Atom.Extra) !u32 {
-    const fields = @typeInfo(Atom.Extra).Struct.fields;
+    const fields = @typeInfo(Atom.Extra).@"struct".fields;
     try self.atoms_extra.ensureUnusedCapacity(allocator, fields.len);
     return self.addAtomExtraAssumeCapacity(extra);
 }
 
 fn addAtomExtraAssumeCapacity(self: *Object, extra: Atom.Extra) u32 {
     const index = @as(u32, @intCast(self.atoms_extra.items.len));
-    const fields = @typeInfo(Atom.Extra).Struct.fields;
+    const fields = @typeInfo(Atom.Extra).@"struct".fields;
     inline for (fields) |field| {
         self.atoms_extra.appendAssumeCapacity(switch (field.type) {
             u32 => @field(extra, field.name),
@@ -2402,7 +2404,7 @@ fn addAtomExtraAssumeCapacity(self: *Object, extra: Atom.Extra) u32 {
 }
 
 pub fn getAtomExtra(self: Object, index: u32) Atom.Extra {
-    const fields = @typeInfo(Atom.Extra).Struct.fields;
+    const fields = @typeInfo(Atom.Extra).@"struct".fields;
     var i: usize = index;
     var result: Atom.Extra = undefined;
     inline for (fields) |field| {
@@ -2417,7 +2419,7 @@ pub fn getAtomExtra(self: Object, index: u32) Atom.Extra {
 
 pub fn setAtomExtra(self: *Object, index: u32, extra: Atom.Extra) void {
     assert(index > 0);
-    const fields = @typeInfo(Atom.Extra).Struct.fields;
+    const fields = @typeInfo(Atom.Extra).@"struct".fields;
     inline for (fields, 0..) |field, i| {
         self.atoms_extra.items[index + i] = switch (field.type) {
             u32 => @field(extra, field.name),
@@ -2445,14 +2447,14 @@ pub fn getSymbolRef(self: Object, index: Symbol.Index, macho_file: *MachO) MachO
 }
 
 pub fn addSymbolExtra(self: *Object, allocator: Allocator, extra: Symbol.Extra) !u32 {
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     try self.symbols_extra.ensureUnusedCapacity(allocator, fields.len);
     return self.addSymbolExtraAssumeCapacity(extra);
 }
 
 fn addSymbolExtraAssumeCapacity(self: *Object, extra: Symbol.Extra) u32 {
     const index = @as(u32, @intCast(self.symbols_extra.items.len));
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     inline for (fields) |field| {
         self.symbols_extra.appendAssumeCapacity(switch (field.type) {
             u32 => @field(extra, field.name),
@@ -2463,7 +2465,7 @@ fn addSymbolExtraAssumeCapacity(self: *Object, extra: Symbol.Extra) u32 {
 }
 
 pub fn getSymbolExtra(self: Object, index: u32) Symbol.Extra {
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     var i: usize = index;
     var result: Symbol.Extra = undefined;
     inline for (fields) |field| {
@@ -2477,7 +2479,7 @@ pub fn getSymbolExtra(self: Object, index: u32) Symbol.Extra {
 }
 
 pub fn setSymbolExtra(self: *Object, index: u32, extra: Symbol.Extra) void {
-    const fields = @typeInfo(Symbol.Extra).Struct.fields;
+    const fields = @typeInfo(Symbol.Extra).@"struct".fields;
     inline for (fields, 0..) |field, i| {
         self.symbols_extra.items[index + i] = switch (field.type) {
             u32 => @field(extra, field.name),
@@ -2673,8 +2675,8 @@ fn formatPath(
 
 const Section = struct {
     header: macho.section_64,
-    subsections: std.ArrayListUnmanaged(Subsection) = .{},
-    relocs: std.ArrayListUnmanaged(Relocation) = .{},
+    subsections: std.ArrayListUnmanaged(Subsection) = .empty,
+    relocs: std.ArrayListUnmanaged(Relocation) = .empty,
 };
 
 const Subsection = struct {
@@ -2690,21 +2692,21 @@ pub const Nlist = struct {
 
 const StabFile = struct {
     comp_dir: u32,
-    stabs: std.ArrayListUnmanaged(Stab) = .{},
+    stabs: std.ArrayListUnmanaged(Stab) = .empty,
 
     fn getCompDir(sf: StabFile, object: Object) [:0]const u8 {
         const nlist = object.symtab.items(.nlist)[sf.comp_dir];
-        return object.getString(nlist.n_strx);
+        return object.getNStrx(nlist.n_strx);
     }
 
     fn getTuName(sf: StabFile, object: Object) [:0]const u8 {
         const nlist = object.symtab.items(.nlist)[sf.comp_dir + 1];
-        return object.getString(nlist.n_strx);
+        return object.getNStrx(nlist.n_strx);
     }
 
     fn getOsoPath(sf: StabFile, object: Object) [:0]const u8 {
         const nlist = object.symtab.items(.nlist)[sf.comp_dir + 2];
-        return object.getString(nlist.n_strx);
+        return object.getNStrx(nlist.n_strx);
     }
 
     fn getOsoModTime(sf: StabFile, object: Object) u64 {
@@ -2762,8 +2764,8 @@ const StabFile = struct {
 };
 
 const CompileUnit = struct {
-    comp_dir: u32,
-    tu_name: u32,
+    comp_dir: MachO.String,
+    tu_name: MachO.String,
 
     fn getCompDir(cu: CompileUnit, object: Object) [:0]const u8 {
         return object.getString(cu.comp_dir);

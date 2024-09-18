@@ -63,6 +63,9 @@ uid: if (native_os == .windows or native_os == .wasi) void else ?posix.uid_t,
 /// Set to change the group id when spawning the child process.
 gid: if (native_os == .windows or native_os == .wasi) void else ?posix.gid_t,
 
+/// Set to change the process group id when spawning the child process.
+pgid: if (native_os == .windows or native_os == .wasi) void else ?posix.pid_t,
+
 /// Set to change the current working directory when spawning the child process.
 cwd: ?[]const u8,
 /// Set to change the current working directory when spawning the child process.
@@ -168,6 +171,7 @@ pub const SpawnError = error{
 } ||
     posix.ExecveError ||
     posix.SetIdError ||
+    posix.SetPgidError ||
     posix.ChangeCurDirError ||
     windows.CreateProcessError ||
     windows.GetProcessMemoryInfoError ||
@@ -213,6 +217,7 @@ pub fn init(argv: []const []const u8, allocator: mem.Allocator) ChildProcess {
         .cwd = null,
         .uid = if (native_os == .windows or native_os == .wasi) {} else null,
         .gid = if (native_os == .windows or native_os == .wasi) {} else null,
+        .pgid = if (native_os == .windows or native_os == .wasi) {} else null,
         .stdin = null,
         .stdout = null,
         .stderr = null,
@@ -675,6 +680,10 @@ fn spawnPosix(self: *ChildProcess) SpawnError!void {
             posix.setreuid(uid, uid) catch |err| forkChildErrReport(err_pipe[1], err);
         }
 
+        if (self.pgid) |pid| {
+            posix.setpgid(0, pid) catch |err| forkChildErrReport(err_pipe[1], err);
+        }
+
         const err = switch (self.expand_arg0) {
             .expand => posix.execvpeZ_expandArg0(.expand, argv_buf.ptr[0].?, argv_buf.ptr, envp),
             .no_expand => posix.execvpeZ_expandArg0(.no_expand, argv_buf.ptr[0].?, argv_buf.ptr, envp),
@@ -898,12 +907,12 @@ fn spawnWindows(self: *ChildProcess) SpawnError!void {
         var cmd_line_cache = WindowsCommandLineCache.init(self.allocator, self.argv);
         defer cmd_line_cache.deinit();
 
-        var app_buf = std.ArrayListUnmanaged(u16){};
+        var app_buf: std.ArrayListUnmanaged(u16) = .empty;
         defer app_buf.deinit(self.allocator);
 
         try app_buf.appendSlice(self.allocator, app_name_w);
 
-        var dir_buf = std.ArrayListUnmanaged(u16){};
+        var dir_buf: std.ArrayListUnmanaged(u16) = .empty;
         defer dir_buf.deinit(self.allocator);
 
         if (cwd_path_w.len > 0) {
@@ -1103,7 +1112,7 @@ fn windowsCreateProcessPathExt(
     }
     var io_status: windows.IO_STATUS_BLOCK = undefined;
 
-    const num_supported_pathext = @typeInfo(WindowsExtension).Enum.fields.len;
+    const num_supported_pathext = @typeInfo(WindowsExtension).@"enum".fields.len;
     var pathext_seen = [_]bool{false} ** num_supported_pathext;
     var any_pathext_seen = false;
     var unappended_exists = false;

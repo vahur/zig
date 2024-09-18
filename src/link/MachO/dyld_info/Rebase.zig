@@ -1,5 +1,5 @@
-entries: std.ArrayListUnmanaged(Entry) = .{},
-buffer: std.ArrayListUnmanaged(u8) = .{},
+entries: std.ArrayListUnmanaged(Entry) = .empty,
+buffer: std.ArrayListUnmanaged(u8) = .empty,
 
 pub const Entry = struct {
     offset: u64,
@@ -35,7 +35,7 @@ pub fn updateSize(rebase: *Rebase, macho_file: *MachO) !void {
         const file = macho_file.getFile(index).?;
         for (file.getAtoms()) |atom_index| {
             const atom = file.getAtom(atom_index) orelse continue;
-            if (!atom.flags.alive) continue;
+            if (!atom.isAlive()) continue;
             if (atom.getInputSection(macho_file).isZerofill()) continue;
             const atom_addr = atom.getAddress(macho_file);
             const seg_id = macho_file.sections.items(.segment_id)[atom.out_n_sect];
@@ -53,18 +53,6 @@ pub fn updateSize(rebase: *Rebase, macho_file: *MachO) !void {
                     .segment_id = seg_id,
                 });
             }
-        }
-    }
-
-    if (macho_file.zig_got_sect_index) |sid| {
-        const seg_id = macho_file.sections.items(.segment_id)[sid];
-        const seg = macho_file.segments.items[seg_id];
-        for (0..macho_file.zig_got.entries.items.len) |idx| {
-            const addr = macho_file.zig_got.entryAddress(@intCast(idx), macho_file);
-            try rebase.entries.append(gpa, .{
-                .offset = addr - seg.vmaddr,
-                .segment_id = seg_id,
-            });
         }
     }
 

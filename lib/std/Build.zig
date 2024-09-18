@@ -21,6 +21,7 @@ pub const Cache = @import("Build/Cache.zig");
 pub const Step = @import("Build/Step.zig");
 pub const Module = @import("Build/Module.zig");
 pub const Watch = @import("Build/Watch.zig");
+pub const Fuzz = @import("Build/Fuzz.zig");
 
 /// Shared state among all Build instances.
 graph: *Graph,
@@ -88,6 +89,7 @@ dep_prefix: []const u8 = "",
 modules: std.StringArrayHashMap(*Module),
 
 named_writefiles: std.StringArrayHashMap(*Step.WriteFile),
+named_lazy_paths: std.StringArrayHashMap(LazyPath),
 /// A map from build root dirs to the corresponding `*Dependency`. This is shared with all child
 /// `Build`s.
 initialized_deps: *InitializedDepMap,
@@ -110,17 +112,19 @@ pub const ReleaseMode = enum {
 /// Settings that are here rather than in Build are not configurable per-package.
 pub const Graph = struct {
     arena: Allocator,
-    system_library_options: std.StringArrayHashMapUnmanaged(SystemLibraryMode) = .{},
+    system_library_options: std.StringArrayHashMapUnmanaged(SystemLibraryMode) = .empty,
     system_package_mode: bool = false,
+    debug_compiler_runtime_libs: bool = false,
     cache: Cache,
     zig_exe: [:0]const u8,
     env_map: EnvMap,
     global_cache_root: Cache.Directory,
     zig_lib_directory: Cache.Directory,
-    needed_lazy_dependencies: std.StringArrayHashMapUnmanaged(void) = .{},
+    needed_lazy_dependencies: std.StringArrayHashMapUnmanaged(void) = .empty,
     /// Information about the native target. Computed before build() is invoked.
     host: ResolvedTarget,
     incremental: ?bool = null,
+    random_seed: u32 = 0,
 };
 
 const AvailableDeps = []const struct { []const u8, []const u8 };
@@ -297,8 +301,9 @@ pub fn create(
         .install_path = undefined,
         .args = null,
         .host = graph.host,
-        .modules = std.StringArrayHashMap(*Module).init(arena),
-        .named_writefiles = std.StringArrayHashMap(*Step.WriteFile).init(arena),
+        .modules = .init(arena),
+        .named_writefiles = .init(arena),
+        .named_lazy_paths = .init(arena),
         .initialized_deps = initialized_deps,
         .pkg_hash = "",
         .available_deps = available_deps,
@@ -390,8 +395,9 @@ fn createChildOnly(
         .glibc_runtimes_dir = parent.glibc_runtimes_dir,
         .host = parent.host,
         .dep_prefix = parent.fmt("{s}{s}.", .{ parent.dep_prefix, dep_name }),
-        .modules = std.StringArrayHashMap(*Module).init(allocator),
-        .named_writefiles = std.StringArrayHashMap(*Step.WriteFile).init(allocator),
+        .modules = .init(allocator),
+        .named_writefiles = .init(allocator),
+        .named_lazy_paths = .init(allocator),
         .initialized_deps = parent.initialized_deps,
         .pkg_hash = pkg_hash,
         .available_deps = pkg_deps,
@@ -405,7 +411,7 @@ fn createChildOnly(
 
 fn userInputOptionsFromArgs(allocator: Allocator, args: anytype) UserInputOptionsMap {
     var user_input_options = UserInputOptionsMap.init(allocator);
-    inline for (@typeInfo(@TypeOf(args)).Struct.fields) |field| {
+    inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |field| {
         const v = @field(args, field.name);
         const T = @TypeOf(v);
         switch (T) {
@@ -451,24 +457,31 @@ fn userInputOptionsFromArgs(allocator: Allocator, args: anytype) UserInputOption
                 }) catch @panic("OOM");
             },
             else => switch (@typeInfo(T)) {
-                .Bool => {
+                .bool => {
                     user_input_options.put(field.name, .{
                         .name = field.name,
                         .value = .{ .scalar = if (v) "true" else "false" },
                         .used = false,
                     }) catch @panic("OOM");
                 },
-                .Enum, .EnumLiteral => {
+                .@"enum", .enum_literal => {
                     user_input_options.put(field.name, .{
                         .name = field.name,
                         .value = .{ .scalar = @tagName(v) },
                         .used = false,
                     }) catch @panic("OOM");
                 },
-                .Int => {
+                .comptime_int, .int => {
                     user_input_options.put(field.name, .{
                         .name = field.name,
                         .value = .{ .scalar = std.fmt.allocPrint(allocator, "{d}", .{v}) catch @panic("OOM") },
+                        .used = false,
+                    }) catch @panic("OOM");
+                },
+                .comptime_float, .float => {
+                    user_input_options.put(field.name, .{
+                        .name = field.name,
+                        .value = .{ .scalar = std.fmt.allocPrint(allocator, "{e}", .{v}) catch @panic("OOM") },
                         .used = false,
                     }) catch @panic("OOM");
                 },
@@ -857,6 +870,7 @@ pub const TestOptions = struct {
     filters: []const []const u8 = &.{},
     test_runner: ?LazyPath = null,
     link_libc: ?bool = null,
+    link_libcpp: ?bool = null,
     single_threaded: ?bool = null,
     pic: ?bool = null,
     strip: ?bool = null,
@@ -886,6 +900,7 @@ pub fn addTest(b: *Build, options: TestOptions) *Step.Compile {
             .target = options.target orelse b.graph.host,
             .optimize = options.optimize,
             .link_libc = options.link_libc,
+            .link_libcpp = options.link_libcpp,
             .single_threaded = options.single_threaded,
             .pic = options.pic,
             .strip = options.strip,
@@ -969,6 +984,7 @@ pub fn addRunArtifact(b: *Build, exe: *Step.Compile) *Step.Run {
     // Consider that this is declarative; the run step may not be run unless a user
     // option is supplied.
     const run_step = Step.Run.create(b, b.fmt("run {s}", .{exe.name}));
+    run_step.producer = exe;
     if (exe.kind == .@"test") {
         if (exe.exec_cmd_args) |exec_cmd_args| {
             for (exec_cmd_args) |cmd_arg| {
@@ -1047,6 +1063,10 @@ pub fn addNamedWriteFiles(b: *Build, name: []const u8) *Step.WriteFile {
     return wf;
 }
 
+pub fn addNamedLazyPath(b: *Build, name: []const u8, lp: LazyPath) void {
+    b.named_lazy_paths.put(b.dupe(name), lp.dupe(b)) catch @panic("OOM");
+}
+
 pub fn addWriteFiles(b: *Build) *Step.WriteFile {
     return Step.WriteFile.create(b);
 }
@@ -1098,7 +1118,7 @@ pub fn option(b: *Build, comptime T: type, name_raw: []const u8, description_raw
     const description = b.dupe(description_raw);
     const type_id = comptime typeToEnum(T);
     const enum_options = if (type_id == .@"enum" or type_id == .enum_list) blk: {
-        const EnumType = if (type_id == .enum_list) @typeInfo(T).Pointer.child else T;
+        const EnumType = if (type_id == .enum_list) @typeInfo(T).pointer.child else T;
         const fields = comptime std.meta.fields(EnumType);
         var options = ArrayList([]const u8).initCapacity(b.allocator, fields.len) catch @panic("OOM");
 
@@ -1252,7 +1272,7 @@ pub fn option(b: *Build, comptime T: type, name_raw: []const u8, description_raw
                 return null;
             },
             .scalar => |s| {
-                const Child = @typeInfo(T).Pointer.child;
+                const Child = @typeInfo(T).pointer.child;
                 const value = std.meta.stringToEnum(Child, s) orelse {
                     log.err("Expected -D{s} to be of type {s}.", .{ name, @typeName(Child) });
                     b.markInvalidUserInput();
@@ -1261,7 +1281,7 @@ pub fn option(b: *Build, comptime T: type, name_raw: []const u8, description_raw
                 return b.allocator.dupe(Child, &[_]Child{value}) catch @panic("OOM");
             },
             .list => |lst| {
-                const Child = @typeInfo(T).Pointer.child;
+                const Child = @typeInfo(T).pointer.child;
                 var new_list = b.allocator.alloc(Child, lst.items.len) catch @panic("OOM");
                 for (lst.items, 0..) |str, i| {
                     const value = std.meta.stringToEnum(Child, str) orelse {
@@ -1529,15 +1549,15 @@ fn typeToEnum(comptime T: type) TypeId {
     return switch (T) {
         std.zig.BuildId => .build_id,
         else => return switch (@typeInfo(T)) {
-            .Int => .int,
-            .Float => .float,
-            .Bool => .bool,
-            .Enum => .@"enum",
-            .Pointer => |pointer| switch (pointer.child) {
+            .int => .int,
+            .float => .float,
+            .bool => .bool,
+            .@"enum" => .@"enum",
+            .pointer => |pointer| switch (pointer.child) {
                 u8 => .string,
                 []const u8 => .list,
                 else => switch (@typeInfo(pointer.child)) {
-                    .Enum => .enum_list,
+                    .@"enum" => .enum_list,
                     else => @compileError("Unsupported type: " ++ @typeName(T)),
                 },
             },
@@ -1713,7 +1733,7 @@ pub fn fmt(b: *Build, comptime format: []const u8, args: anytype) []u8 {
 }
 
 fn supportedWindowsProgramExtension(ext: []const u8) bool {
-    inline for (@typeInfo(std.process.Child.WindowsExtension).Enum.fields) |field| {
+    inline for (@typeInfo(std.process.Child.WindowsExtension).@"enum".fields) |field| {
         if (std.ascii.eqlIgnoreCase(ext, "." ++ field.name)) return true;
     }
     return false;
@@ -1795,6 +1815,7 @@ pub fn runAllowFail(
     child.stderr_behavior = stderr_behavior;
     child.env_map = &b.graph.env_map;
 
+    try Step.handleVerbose2(b, null, child.env_map, argv);
     try child.spawn();
 
     const stdout = child.stdout.?.reader().readAllAlloc(b.allocator, max_output_size) catch {
@@ -1888,6 +1909,12 @@ pub const Dependency = struct {
         };
     }
 
+    pub fn namedLazyPath(d: *Dependency, name: []const u8) LazyPath {
+        return d.builder.named_lazy_paths.get(name) orelse {
+            panic("unable to find named lazypath '{s}'", .{name});
+        };
+    }
+
     pub fn path(d: *Dependency, sub_path: []const u8) LazyPath {
         return .{
             .dependency = .{
@@ -1911,7 +1938,7 @@ inline fn findImportPkgHashOrFatal(b: *Build, comptime asking_build_zig: type, c
     const build_runner = @import("root");
     const deps = build_runner.dependencies;
 
-    const b_pkg_hash, const b_pkg_deps = comptime for (@typeInfo(deps.packages).Struct.decls) |decl| {
+    const b_pkg_hash, const b_pkg_deps = comptime for (@typeInfo(deps.packages).@"struct".decls) |decl| {
         const pkg_hash = decl.name;
         const pkg = @field(deps.packages, pkg_hash);
         if (@hasDecl(pkg, "build_zig") and pkg.build_zig == asking_build_zig) break .{ pkg_hash, pkg.deps };
@@ -1949,7 +1976,7 @@ pub fn lazyDependency(b: *Build, name: []const u8, args: anytype) ?*Dependency {
     const deps = build_runner.dependencies;
     const pkg_hash = findPkgHashOrFatal(b, name);
 
-    inline for (@typeInfo(deps.packages).Struct.decls) |decl| {
+    inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
         if (mem.eql(u8, decl.name, pkg_hash)) {
             const pkg = @field(deps.packages, decl.name);
             const available = !@hasDecl(pkg, "available") or pkg.available;
@@ -1969,7 +1996,7 @@ pub fn dependency(b: *Build, name: []const u8, args: anytype) *Dependency {
     const deps = build_runner.dependencies;
     const pkg_hash = findPkgHashOrFatal(b, name);
 
-    inline for (@typeInfo(deps.packages).Struct.decls) |decl| {
+    inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
         if (mem.eql(u8, decl.name, pkg_hash)) {
             const pkg = @field(deps.packages, decl.name);
             if (@hasDecl(pkg, "available")) {
@@ -1999,7 +2026,7 @@ pub inline fn lazyImport(
     const deps = build_runner.dependencies;
     const pkg_hash = findImportPkgHashOrFatal(b, asking_build_zig, dep_name);
 
-    inline for (@typeInfo(deps.packages).Struct.decls) |decl| {
+    inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
         if (comptime mem.eql(u8, decl.name, pkg_hash)) {
             const pkg = @field(deps.packages, decl.name);
             const available = !@hasDecl(pkg, "available") or pkg.available;
@@ -2028,7 +2055,7 @@ pub fn dependencyFromBuildZig(
     const deps = build_runner.dependencies;
 
     find_dep: {
-        const pkg, const pkg_hash = inline for (@typeInfo(deps.packages).Struct.decls) |decl| {
+        const pkg, const pkg_hash = inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
             const pkg_hash = decl.name;
             const pkg = @field(deps.packages, pkg_hash);
             if (@hasDecl(pkg, "build_zig") and pkg.build_zig == build_zig) break .{ pkg, pkg_hash };
@@ -2136,9 +2163,9 @@ fn dependencyInner(
 }
 
 pub fn runBuild(b: *Build, build_zig: anytype) anyerror!void {
-    switch (@typeInfo(@typeInfo(@TypeOf(build_zig.build)).Fn.return_type.?)) {
-        .Void => build_zig.build(b),
-        .ErrorUnion => try build_zig.build(b),
+    switch (@typeInfo(@typeInfo(@TypeOf(build_zig.build)).@"fn".return_type.?)) {
+        .void => build_zig.build(b),
+        .error_union => try build_zig.build(b),
         else => @compileError("expected return type of build to be 'void' or '!void'"),
     }
 }
@@ -2287,22 +2314,26 @@ pub const LazyPath = union(enum) {
     }
 
     pub fn path(lazy_path: LazyPath, b: *Build, sub_path: []const u8) LazyPath {
+        return lazy_path.join(b.allocator, sub_path) catch @panic("OOM");
+    }
+
+    pub fn join(lazy_path: LazyPath, arena: Allocator, sub_path: []const u8) Allocator.Error!LazyPath {
         return switch (lazy_path) {
             .src_path => |src| .{ .src_path = .{
                 .owner = src.owner,
-                .sub_path = b.pathResolve(&.{ src.sub_path, sub_path }),
+                .sub_path = try fs.path.resolve(arena, &.{ src.sub_path, sub_path }),
             } },
             .generated => |gen| .{ .generated = .{
                 .file = gen.file,
                 .up = gen.up,
-                .sub_path = b.pathResolve(&.{ gen.sub_path, sub_path }),
+                .sub_path = try fs.path.resolve(arena, &.{ gen.sub_path, sub_path }),
             } },
             .cwd_relative => |cwd_relative| .{
-                .cwd_relative = b.pathResolve(&.{ cwd_relative, sub_path }),
+                .cwd_relative = try fs.path.resolve(arena, &.{ cwd_relative, sub_path }),
             },
             .dependency => |dep| .{ .dependency = .{
                 .dependency = dep.dependency,
-                .sub_path = b.pathResolve(&.{ dep.sub_path, sub_path }),
+                .sub_path = try fs.path.resolve(arena, &.{ dep.sub_path, sub_path }),
             } },
         };
     }
@@ -2356,7 +2387,7 @@ pub const LazyPath = union(enum) {
                 // basis for not traversing up too many directories.
 
                 var file_path: Cache.Path = .{
-                    .root_dir = gen.file.step.owner.build_root,
+                    .root_dir = Cache.Directory.cwd(),
                     .sub_path = gen.file.path orelse {
                         std.debug.lockStdErr();
                         const stderr = std.io.getStdErr();
@@ -2522,7 +2553,7 @@ pub const InstallDir = union(enum) {
 /// function.
 pub fn makeTempPath(b: *Build) []const u8 {
     const rand_int = std.crypto.random.int(u64);
-    const tmp_dir_sub_path = "tmp" ++ fs.path.sep_str ++ hex64(rand_int);
+    const tmp_dir_sub_path = "tmp" ++ fs.path.sep_str ++ std.fmt.hex(rand_int);
     const result_path = b.cache_root.join(b.allocator, &.{tmp_dir_sub_path}) catch @panic("OOM");
     b.cache_root.handle.makePath(tmp_dir_sub_path) catch |err| {
         std.debug.print("unable to make tmp path '{s}': {s}\n", .{
@@ -2532,18 +2563,9 @@ pub fn makeTempPath(b: *Build) []const u8 {
     return result_path;
 }
 
-/// There are a few copies of this function in miscellaneous places. Would be nice to find
-/// a home for them.
+/// Deprecated; use `std.fmt.hex` instead.
 pub fn hex64(x: u64) [16]u8 {
-    const hex_charset = "0123456789abcdef";
-    var result: [16]u8 = undefined;
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const byte: u8 = @truncate(x >> @as(u6, @intCast(8 * i)));
-        result[i * 2 + 0] = hex_charset[byte >> 4];
-        result[i * 2 + 1] = hex_charset[byte & 15];
-    }
-    return result;
+    return std.fmt.hex(x);
 }
 
 /// A pair of target query and fully resolved target.
