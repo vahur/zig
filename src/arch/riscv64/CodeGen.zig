@@ -1593,7 +1593,6 @@ fn genBody(func: *Func, body: []const Air.Inst.Index) InnerError!void {
             .breakpoint      => try func.airBreakpoint(),
             .ret_addr        => try func.airRetAddr(inst),
             .frame_addr      => try func.airFrameAddress(inst),
-            .fence           => try func.airFence(inst),
             .cond_br         => try func.airCondBr(inst),
             .dbg_stmt        => try func.airDbgStmt(inst),
             .fptrunc         => try func.airFptrunc(inst),
@@ -4833,26 +4832,6 @@ fn airFrameAddress(func: *Func, inst: Air.Inst.Index) !void {
     return func.finishAir(inst, dst_mcv, .{ .none, .none, .none });
 }
 
-fn airFence(func: *Func, inst: Air.Inst.Index) !void {
-    const order = func.air.instructions.items(.data)[@intFromEnum(inst)].fence;
-    const pred: Mir.Barrier, const succ: Mir.Barrier = switch (order) {
-        .unordered, .monotonic => unreachable,
-        .acquire => .{ .r, .rw },
-        .release => .{ .rw, .r },
-        .acq_rel => .{ .rw, .rw },
-        .seq_cst => .{ .rw, .rw },
-    };
-
-    _ = try func.addInst(.{
-        .tag = if (order == .acq_rel) .fencetso else .fence,
-        .data = .{ .fence = .{
-            .pred = pred,
-            .succ = succ,
-        } },
-    });
-    return func.finishAirBookkeeping();
-}
-
 fn airCall(func: *Func, inst: Air.Inst.Index, modifier: std.builtin.CallModifier) !void {
     if (modifier == .always_tail) return func.fail("TODO implement tail calls for riscv64", .{});
     const pl_op = func.air.instructions.items(.data)[@intFromEnum(inst)].pl_op;
@@ -5183,6 +5162,7 @@ fn airCmp(func: *Func, inst: Air.Inst.Index, tag: Air.Inst.Tag) !void {
     const bin_op = func.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
     const pt = func.pt;
     const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
 
     const result: MCValue = if (func.liveness.isUnused(inst)) .unreach else result: {
         const lhs_ty = func.typeOf(bin_op.lhs);
@@ -5194,6 +5174,7 @@ fn airCmp(func: *Func, inst: Air.Inst.Index, tag: Air.Inst.Tag) !void {
             .pointer,
             .error_set,
             .optional,
+            .@"struct",
             => {
                 const int_ty = switch (lhs_ty.zigTypeTag(zcu)) {
                     .@"enum" => lhs_ty.intTagType(zcu),
@@ -5210,6 +5191,12 @@ fn airCmp(func: *Func, inst: Air.Inst.Index, tag: Air.Inst.Tag) !void {
                         } else {
                             return func.fail("TODO riscv cmp non-pointer optionals", .{});
                         }
+                    },
+                    .@"struct" => blk: {
+                        const struct_obj = ip.loadStructType(lhs_ty.toIntern());
+                        assert(struct_obj.layout == .@"packed");
+                        const backing_index = struct_obj.backingIntTypeUnordered(ip);
+                        break :blk Type.fromInterned(backing_index);
                     },
                     else => unreachable,
                 };

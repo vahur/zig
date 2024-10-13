@@ -39,6 +39,7 @@ pub fn baseZigTypeTag(self: Type, mod: *Zcu) std.builtin.TypeId {
     };
 }
 
+/// Asserts the type is resolved.
 pub fn isSelfComparable(ty: Type, zcu: *const Zcu, is_equality_cmp: bool) bool {
     return switch (ty.zigTypeTag(zcu)) {
         .int,
@@ -62,7 +63,6 @@ pub fn isSelfComparable(ty: Type, zcu: *const Zcu, is_equality_cmp: bool) bool {
 
         .noreturn,
         .array,
-        .@"struct",
         .undefined,
         .null,
         .error_union,
@@ -70,6 +70,7 @@ pub fn isSelfComparable(ty: Type, zcu: *const Zcu, is_equality_cmp: bool) bool {
         .frame,
         => false,
 
+        .@"struct" => is_equality_cmp and ty.containerLayout(zcu) == .@"packed",
         .pointer => !ty.isSlice(zcu) and (is_equality_cmp or ty.isCPtr(zcu)),
         .optional => {
             if (!is_equality_cmp) return false;
@@ -1641,6 +1642,7 @@ pub fn maxIntAlignment(target: std.Target, use_llvm: bool) u16 {
         .avr => 1,
         .msp430 => 2,
         .xcore => 4,
+        .propeller1, .propeller2 => 4,
 
         .arm,
         .armeb,
@@ -1703,7 +1705,6 @@ pub fn maxIntAlignment(target: std.Target, use_llvm: bool) u16 {
         .spirv32,
         .ve,
         .spirv64,
-        .dxil,
         .loongarch32,
         .loongarch64,
         .xtensa,
@@ -2678,11 +2679,11 @@ pub fn onePossibleValue(starting_type: Type, pt: Zcu.PerThread) !?Value {
                 const only_field_ty = union_obj.field_types.get(ip)[0];
                 const val_val = (try Type.fromInterned(only_field_ty).onePossibleValue(pt)) orelse
                     return null;
-                const only = try pt.intern(.{ .un = .{
+                const only = try pt.internUnion(.{
                     .ty = ty.toIntern(),
                     .tag = tag_val.toIntern(),
                     .val = val_val.toIntern(),
-                } });
+                });
                 return Value.fromInterned(only);
             },
             .opaque_type => return null,
