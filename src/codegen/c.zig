@@ -48,6 +48,60 @@ pub const CValue = union(enum) {
     payload_identifier: []const u8,
     /// Rendered with fmtCTypePoolString
     ctype_pool_string: CType.Pool.String,
+
+    fn eql(lhs: CValue, rhs: CValue) bool {
+        return switch (lhs) {
+            .none => rhs == .none,
+            .new_local, .local => |lhs_local| switch (rhs) {
+                .new_local, .local => |rhs_local| lhs_local == rhs_local,
+                else => false,
+            },
+            .local_ref => |lhs_local| switch (rhs) {
+                .local_ref => |rhs_local| lhs_local == rhs_local,
+                else => false,
+            },
+            .constant => |lhs_val| switch (rhs) {
+                .constant => |rhs_val| lhs_val.toIntern() == rhs_val.toIntern(),
+                else => false,
+            },
+            .arg => |lhs_arg_index| switch (rhs) {
+                .arg => |rhs_arg_index| lhs_arg_index == rhs_arg_index,
+                else => false,
+            },
+            .arg_array => |lhs_arg_index| switch (rhs) {
+                .arg_array => |rhs_arg_index| lhs_arg_index == rhs_arg_index,
+                else => false,
+            },
+            .field => |lhs_field_index| switch (rhs) {
+                .field => |rhs_field_index| lhs_field_index == rhs_field_index,
+                else => false,
+            },
+            .nav => |lhs_nav| switch (rhs) {
+                .nav => |rhs_nav| lhs_nav == rhs_nav,
+                else => false,
+            },
+            .nav_ref => |lhs_nav| switch (rhs) {
+                .nav_ref => |rhs_nav| lhs_nav == rhs_nav,
+                else => false,
+            },
+            .undef => |lhs_ty| switch (rhs) {
+                .undef => |rhs_ty| lhs_ty.toIntern() == rhs_ty.toIntern(),
+                else => false,
+            },
+            .identifier => |lhs_id| switch (rhs) {
+                .identifier => |rhs_id| std.mem.eql(u8, lhs_id, rhs_id),
+                else => false,
+            },
+            .payload_identifier => |lhs_id| switch (rhs) {
+                .payload_identifier => |rhs_id| std.mem.eql(u8, lhs_id, rhs_id),
+                else => false,
+            },
+            .ctype_pool_string => |lhs_str| switch (rhs) {
+                .ctype_pool_string => |rhs_str| lhs_str.index == rhs_str.index,
+                else => false,
+            },
+        };
+    }
 };
 
 const BlockData = struct {
@@ -716,11 +770,14 @@ pub const DeclGen = struct {
         const ctype_pool = &dg.ctype_pool;
 
         // Chase function values in order to be able to reference the original function.
-        const owner_nav = switch (ip.indexToKey(zcu.navValue(nav_index).toIntern())) {
-            .variable => |variable| variable.owner_nav,
-            .func => |func| func.owner_nav,
-            .@"extern" => |@"extern"| @"extern".owner_nav,
-            else => nav_index,
+        const owner_nav = switch (ip.getNav(nav_index).status) {
+            .unresolved => unreachable,
+            .type_resolved => nav_index, // this can't be an extern or a function
+            .fully_resolved => |r| switch (ip.indexToKey(r.val)) {
+                .func => |f| f.owner_nav,
+                .@"extern" => |e| e.owner_nav,
+                else => nav_index,
+            },
         };
 
         // Render an undefined pointer if we have a pointer to a zero-bit or comptime type.
@@ -891,7 +948,7 @@ pub const DeclGen = struct {
             .error_union_type,
             .simple_type,
             .struct_type,
-            .anon_struct_type,
+            .tuple_type,
             .union_type,
             .opaque_type,
             .enum_type,
@@ -908,7 +965,7 @@ pub const DeclGen = struct {
                 .undefined => unreachable,
                 .void => unreachable,
                 .null => unreachable,
-                .empty_struct => unreachable,
+                .empty_tuple => unreachable,
                 .@"unreachable" => unreachable,
                 .generic_poison => unreachable,
 
@@ -1194,7 +1251,7 @@ pub const DeclGen = struct {
                         try writer.writeByte('}');
                     }
                 },
-                .anon_struct_type => |tuple| {
+                .tuple_type => |tuple| {
                     if (!location.isInitializer()) {
                         try writer.writeByte('(');
                         try dg.renderCType(writer, ctype);
@@ -1605,7 +1662,7 @@ pub const DeclGen = struct {
                         }),
                     }
                 },
-                .anon_struct_type => |anon_struct_info| {
+                .tuple_type => |tuple_info| {
                     if (!location.isInitializer()) {
                         try writer.writeByte('(');
                         try dg.renderCType(writer, ctype);
@@ -1614,9 +1671,9 @@ pub const DeclGen = struct {
 
                     try writer.writeByte('{');
                     var need_comma = false;
-                    for (0..anon_struct_info.types.len) |field_index| {
-                        if (anon_struct_info.values.get(ip)[field_index] != .none) continue;
-                        const field_ty = Type.fromInterned(anon_struct_info.types.get(ip)[field_index]);
+                    for (0..tuple_info.types.len) |field_index| {
+                        if (tuple_info.values.get(ip)[field_index] != .none) continue;
+                        const field_ty = Type.fromInterned(tuple_info.types.get(ip)[field_index]);
                         if (!field_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
 
                         if (need_comma) try writer.writeByte(',');
@@ -1783,7 +1840,7 @@ pub const DeclGen = struct {
         const fn_ctype = try dg.ctypeFromType(fn_ty, kind);
 
         const fn_info = zcu.typeToFunc(fn_ty).?;
-        if (fn_info.cc == .Naked) {
+        if (fn_info.cc == .naked) {
             switch (kind) {
                 .forward => try w.writeAll("zig_naked_decl "),
                 .complete => try w.writeAll("zig_naked "),
@@ -1796,7 +1853,7 @@ pub const DeclGen = struct {
 
         var trailing = try renderTypePrefix(dg.pass, &dg.ctype_pool, zcu, w, fn_ctype, .suffix, .{});
 
-        if (toCallingConvention(fn_info.cc)) |call_conv| {
+        if (toCallingConvention(fn_info.cc, zcu)) |call_conv| {
             try w.print("{}zig_callconv({s})", .{ trailing, call_conv });
             trailing = .maybe_space;
         }
@@ -2183,7 +2240,7 @@ pub const DeclGen = struct {
             Type.fromInterned(nav.typeOf(ip)),
             .{ .nav = nav_index },
             CQualifiers.init(.{ .@"const" = flags.is_const }),
-            nav.status.resolved.alignment,
+            nav.getAlignment(),
             .complete,
         );
         try fwd.writeAll(";\n");
@@ -2192,19 +2249,19 @@ pub const DeclGen = struct {
     fn renderNavName(dg: *DeclGen, writer: anytype, nav_index: InternPool.Nav.Index) !void {
         const zcu = dg.pt.zcu;
         const ip = &zcu.intern_pool;
-        switch (ip.indexToKey(zcu.navValue(nav_index).toIntern())) {
-            .@"extern" => |@"extern"| try writer.print("{ }", .{
+        const nav = ip.getNav(nav_index);
+        if (nav.getExtern(ip)) |@"extern"| {
+            try writer.print("{ }", .{
                 fmtIdent(ip.getNav(@"extern".owner_nav).name.toSlice(ip)),
-            }),
-            else => {
-                // MSVC has a limit of 4095 character token length limit, and fmtIdent can (worst case),
-                // expand to 3x the length of its input, but let's cut it off at a much shorter limit.
-                const fqn_slice = ip.getNav(nav_index).fqn.toSlice(ip);
-                try writer.print("{}__{d}", .{
-                    fmtIdent(fqn_slice[0..@min(fqn_slice.len, 100)]),
-                    @intFromEnum(nav_index),
-                });
-            },
+            });
+        } else {
+            // MSVC has a limit of 4095 character token length limit, and fmtIdent can (worst case),
+            // expand to 3x the length of its input, but let's cut it off at a much shorter limit.
+            const fqn_slice = ip.getNav(nav_index).fqn.toSlice(ip);
+            try writer.print("{}__{d}", .{
+                fmtIdent(fqn_slice[0..@min(fqn_slice.len, 100)]),
+                @intFromEnum(nav_index),
+            });
         }
     }
 
@@ -2772,7 +2829,7 @@ pub fn genLazyFn(o: *Object, lazy_ctype_pool: *const CType.Pool, lazy_fn: LazyFn
 
             const fwd = o.dg.fwdDeclWriter();
             try fwd.print("static zig_{s} ", .{@tagName(key)});
-            try o.dg.renderFunctionSignature(fwd, fn_val, ip.getNav(fn_nav_index).status.resolved.alignment, .forward, .{
+            try o.dg.renderFunctionSignature(fwd, fn_val, ip.getNav(fn_nav_index).getAlignment(), .forward, .{
                 .fmt_ctype_pool_string = fn_name,
             });
             try fwd.writeAll(";\n");
@@ -2813,13 +2870,13 @@ pub fn genFunc(f: *Function) !void {
     try o.dg.renderFunctionSignature(
         fwd,
         nav_val,
-        nav.status.resolved.alignment,
+        nav.status.fully_resolved.alignment,
         .forward,
         .{ .nav = nav_index },
     );
     try fwd.writeAll(";\n");
 
-    if (nav.status.resolved.@"linksection".toSlice(ip)) |s|
+    if (nav.status.fully_resolved.@"linksection".toSlice(ip)) |s|
         try o.writer().print("zig_linksection_fn({s}) ", .{fmtStringLiteral(s, null)});
     try o.dg.renderFunctionSignature(
         o.writer(),
@@ -2898,7 +2955,7 @@ pub fn genDecl(o: *Object) !void {
     const nav_ty = Type.fromInterned(nav.typeOf(ip));
 
     if (!nav_ty.isFnOrHasRuntimeBitsIgnoreComptime(zcu)) return;
-    switch (ip.indexToKey(nav.status.resolved.val)) {
+    switch (ip.indexToKey(nav.status.fully_resolved.val)) {
         .@"extern" => |@"extern"| {
             if (!ip.isFunctionType(nav_ty.toIntern())) return o.dg.renderFwdDecl(o.dg.pass.nav, .{
                 .is_extern = true,
@@ -2911,8 +2968,8 @@ pub fn genDecl(o: *Object) !void {
             try fwd.writeAll("zig_extern ");
             try o.dg.renderFunctionSignature(
                 fwd,
-                Value.fromInterned(nav.status.resolved.val),
-                nav.status.resolved.alignment,
+                Value.fromInterned(nav.status.fully_resolved.val),
+                nav.status.fully_resolved.alignment,
                 .forward,
                 .{ .@"export" = .{
                     .main_name = nav.name,
@@ -2931,14 +2988,14 @@ pub fn genDecl(o: *Object) !void {
             const w = o.writer();
             if (variable.is_weak_linkage) try w.writeAll("zig_weak_linkage ");
             if (variable.is_threadlocal and !o.dg.mod.single_threaded) try w.writeAll("zig_threadlocal ");
-            if (nav.status.resolved.@"linksection".toSlice(&zcu.intern_pool)) |s|
+            if (nav.status.fully_resolved.@"linksection".toSlice(&zcu.intern_pool)) |s|
                 try w.print("zig_linksection({s}) ", .{fmtStringLiteral(s, null)});
             try o.dg.renderTypeAndName(
                 w,
                 nav_ty,
                 .{ .nav = o.dg.pass.nav },
                 .{},
-                nav.status.resolved.alignment,
+                nav.status.fully_resolved.alignment,
                 .complete,
             );
             try w.writeAll(" = ");
@@ -2948,10 +3005,10 @@ pub fn genDecl(o: *Object) !void {
         },
         else => try genDeclValue(
             o,
-            Value.fromInterned(nav.status.resolved.val),
+            Value.fromInterned(nav.status.fully_resolved.val),
             .{ .nav = o.dg.pass.nav },
-            nav.status.resolved.alignment,
-            nav.status.resolved.@"linksection",
+            nav.status.fully_resolved.alignment,
+            nav.status.fully_resolved.@"linksection",
         ),
     }
 }
@@ -3289,6 +3346,7 @@ fn genBodyInner(f: *Function, body: []const Air.Inst.Index) error{ AnalysisFail,
             .try_ptr_cold => try airTryPtr(f, inst),
 
             .dbg_stmt => try airDbgStmt(f, inst),
+            .dbg_empty_stmt => try airDbgEmptyStmt(f, inst),
             .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => try airDbgVar(f, inst),
 
             .float_from_int,
@@ -4218,17 +4276,23 @@ fn airCmpOp(
     const writer = f.object.writer();
     const local = try f.allocLocal(inst, inst_ty);
     const v = try Vectorize.start(f, inst, writer, lhs_ty);
+    const a = try Assignment.start(f, writer, try f.ctypeFromType(scalar_ty, .complete));
     try f.writeCValue(writer, local, .Other);
     try v.elem(f, writer);
-    try writer.writeAll(" = ");
-    if (need_cast) try writer.writeAll("(void*)");
-    try f.writeCValue(writer, lhs, .Other);
-    try v.elem(f, writer);
-    try writer.writeAll(compareOperatorC(operator));
-    if (need_cast) try writer.writeAll("(void*)");
-    try f.writeCValue(writer, rhs, .Other);
-    try v.elem(f, writer);
-    try writer.writeAll(";\n");
+    try a.assign(f, writer);
+    if (lhs != .undef and lhs.eql(rhs)) try writer.writeAll(switch (operator) {
+        .lt, .neq, .gt => "false",
+        .lte, .eq, .gte => "true",
+    }) else {
+        if (need_cast) try writer.writeAll("(void*)");
+        try f.writeCValue(writer, lhs, .Other);
+        try v.elem(f, writer);
+        try writer.writeAll(compareOperatorC(operator));
+        if (need_cast) try writer.writeAll("(void*)");
+        try f.writeCValue(writer, rhs, .Other);
+        try v.elem(f, writer);
+    }
+    try a.end(f, writer);
     try v.end(f, inst, writer);
 
     return local;
@@ -4269,7 +4333,11 @@ fn airEquality(
     try a.assign(f, writer);
 
     const operand_ctype = try f.ctypeFromType(operand_ty, .complete);
-    switch (operand_ctype.info(ctype_pool)) {
+    if (lhs != .undef and lhs.eql(rhs)) try writer.writeAll(switch (operator) {
+        .lt, .lte, .gte, .gt => unreachable,
+        .neq => "false",
+        .eq => "true",
+    }) else switch (operand_ctype.info(ctype_pool)) {
         .basic, .pointer => {
             try f.writeCValue(writer, lhs, .Other);
             try writer.writeAll(compareOperatorC(operator));
@@ -4598,6 +4666,11 @@ fn airDbgStmt(f: *Function, inst: Air.Inst.Index) !CValue {
     // Perhaps an additional compilation option is in order?
     //try writer.print("#line {d}\n", .{dbg_stmt.line + 1});
     try writer.print("/* file:{d}:{d} */\n", .{ dbg_stmt.line + 1, dbg_stmt.column + 1 });
+    return .none;
+}
+
+fn airDbgEmptyStmt(f: *Function, _: Air.Inst.Index) !CValue {
+    try f.object.writer().writeAll("(void)0;\n");
     return .none;
 }
 
@@ -5190,7 +5263,7 @@ fn asmInputNeedsLocal(f: *Function, constraint: []const u8, value: CValue) bool 
     return switch (constraint[0]) {
         '{' => true,
         'i', 'r' => false,
-        'I' => !target.cpu.arch.isArmOrThumb(),
+        'I' => !target.cpu.arch.isArm(),
         else => switch (value) {
             .constant => |val| switch (dg.pt.zcu.intern_pool.indexToKey(val.toIntern())) {
                 .ptr => |ptr| if (ptr.byte_offset == 0) switch (ptr.base_addr) {
@@ -5411,9 +5484,9 @@ fn airAsm(f: *Function, inst: Air.Inst.Index) !CValue {
             const input_val = try f.resolveInst(input);
             try writer.print("{s}(", .{fmtStringLiteral(if (is_reg) "r" else constraint, null)});
             try f.writeCValue(writer, if (asmInputNeedsLocal(f, constraint, input_val)) local: {
-                const input_local = .{ .local = locals_index };
+                const input_local_idx = locals_index;
                 locals_index += 1;
-                break :local input_local;
+                break :local .{ .local = input_local_idx };
             } else input_val, .Other);
             try writer.writeByte(')');
         }
@@ -5651,15 +5724,12 @@ fn fieldLocation(
                     .begin,
             };
         },
-        .anon_struct_type => |anon_struct_info| return if (!container_ty.hasRuntimeBitsIgnoreComptime(zcu))
+        .tuple_type => return if (!container_ty.hasRuntimeBitsIgnoreComptime(zcu))
             .begin
         else if (!field_ptr_ty.childType(zcu).hasRuntimeBitsIgnoreComptime(zcu))
             .{ .byte_offset = container_ty.structFieldOffset(field_index, zcu) }
         else
-            .{ .field = if (anon_struct_info.fieldName(ip, field_index).unwrap()) |field_name|
-                .{ .identifier = field_name.toSlice(ip) }
-            else
-                .{ .field = field_index } },
+            .{ .field = .{ .field = field_index } },
         .union_type => {
             const loaded_union = ip.loadUnionType(container_ty.toIntern());
             switch (loaded_union.flagsUnordered(ip).layout) {
@@ -5892,10 +5962,7 @@ fn airStructFieldVal(f: *Function, inst: Air.Inst.Index) !CValue {
                 },
             }
         },
-        .anon_struct_type => |anon_struct_info| if (anon_struct_info.fieldName(ip, extra.field_index).unwrap()) |field_name|
-            .{ .identifier = field_name.toSlice(ip) }
-        else
-            .{ .field = extra.field_index },
+        .tuple_type => .{ .field = extra.field_index },
         .union_type => field_name: {
             const loaded_union = ip.loadUnionType(struct_ty.toIntern());
             switch (loaded_union.flagsUnordered(ip).layout) {
@@ -7366,16 +7433,13 @@ fn airAggregateInit(f: *Function, inst: Air.Inst.Index) !CValue {
                 },
             }
         },
-        .anon_struct_type => |anon_struct_info| for (0..anon_struct_info.types.len) |field_index| {
-            if (anon_struct_info.values.get(ip)[field_index] != .none) continue;
-            const field_ty = Type.fromInterned(anon_struct_info.types.get(ip)[field_index]);
+        .tuple_type => |tuple_info| for (0..tuple_info.types.len) |field_index| {
+            if (tuple_info.values.get(ip)[field_index] != .none) continue;
+            const field_ty = Type.fromInterned(tuple_info.types.get(ip)[field_index]);
             if (!field_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
 
             const a = try Assignment.start(f, writer, try f.ctypeFromType(field_ty, .complete));
-            try f.writeCValueMember(writer, local, if (anon_struct_info.fieldName(ip, field_index).unwrap()) |field_name|
-                .{ .identifier = field_name.toSlice(ip) }
-            else
-                .{ .field = field_index });
+            try f.writeCValueMember(writer, local, .{ .field = field_index });
             try a.assign(f, writer);
             try f.writeCValue(writer, resolved_elements[field_index], .Other);
             try a.end(f, writer);
@@ -7604,12 +7668,72 @@ fn writeMemoryOrder(w: anytype, order: std.builtin.AtomicOrder) !void {
     return w.writeAll(toMemoryOrder(order));
 }
 
-fn toCallingConvention(call_conv: std.builtin.CallingConvention) ?[]const u8 {
-    return switch (call_conv) {
-        .Stdcall => "stdcall",
-        .Fastcall => "fastcall",
-        .Vectorcall => "vectorcall",
-        else => null,
+fn toCallingConvention(cc: std.builtin.CallingConvention, zcu: *Zcu) ?[]const u8 {
+    if (zcu.getTarget().cCallingConvention()) |ccc| {
+        if (cc.eql(ccc)) {
+            return null;
+        }
+    }
+    return switch (cc) {
+        .auto, .naked => null,
+
+        .x86_64_sysv, .x86_sysv => "sysv_abi",
+        .x86_64_win, .x86_win => "ms_abi",
+        .x86_stdcall => "stdcall",
+        .x86_fastcall => "fastcall",
+        .x86_thiscall => "thiscall",
+
+        .x86_vectorcall,
+        .x86_64_vectorcall,
+        => "vectorcall",
+
+        .x86_64_regcall_v3_sysv,
+        .x86_64_regcall_v4_win,
+        .x86_regcall_v3,
+        .x86_regcall_v4_win,
+        => "regcall",
+
+        .aarch64_vfabi => "aarch64_vector_pcs",
+        .aarch64_vfabi_sve => "aarch64_sve_pcs",
+
+        .arm_aapcs => "pcs(\"aapcs\")",
+        .arm_aapcs_vfp, .arm_aapcs16_vfp => "pcs(\"aapcs-vfp\")",
+
+        .arm_interrupt => |opts| switch (opts.type) {
+            .generic => "interrupt",
+            .irq => "interrupt(\"IRQ\")",
+            .fiq => "interrupt(\"FIQ\")",
+            .swi => "interrupt(\"SWI\")",
+            .abort => "interrupt(\"ABORT\")",
+            .undef => "interrupt(\"UNDEF\")",
+        },
+
+        .avr_signal => "signal",
+
+        .mips_interrupt,
+        .mips64_interrupt,
+        => |opts| switch (opts.mode) {
+            inline else => |m| "interrupt(\"" ++ @tagName(m) ++ "\")",
+        },
+
+        .riscv64_lp64_v, .riscv32_ilp32_v => "riscv_vector_cc",
+
+        .riscv32_interrupt,
+        .riscv64_interrupt,
+        => |opts| switch (opts.mode) {
+            inline else => |m| "interrupt(\"" ++ @tagName(m) ++ "\")",
+        },
+
+        .m68k_rtd => "m68k_rtd",
+
+        .avr_interrupt,
+        .csky_interrupt,
+        .m68k_interrupt,
+        .x86_interrupt,
+        .x86_64_interrupt,
+        => "interrupt",
+
+        else => unreachable, // `Zcu.callconvSupported`
     };
 }
 

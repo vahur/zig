@@ -14,6 +14,8 @@ pub const isPrimitive = primitives.isPrimitive;
 pub const Ast = @import("zig/Ast.zig");
 pub const AstGen = @import("zig/AstGen.zig");
 pub const Zir = @import("zig/Zir.zig");
+pub const Zoir = @import("zig/Zoir.zig");
+pub const ZonGen = @import("zig/ZonGen.zig");
 pub const system = @import("zig/system.zig");
 pub const CrossTarget = @compileError("deprecated; use std.Target.Query");
 pub const BuiltinFn = @import("zig/BuiltinFn.zig");
@@ -659,6 +661,17 @@ pub fn parseTargetQueryOrReportFatalError(
                 std.log.info("available object formats:\n{s}", .{help_text.items});
             }
             fatal("unknown object format: '{s}'", .{opts.object_format.?});
+        },
+        error.UnknownArchitecture => {
+            help: {
+                var help_text = std.ArrayList(u8).init(allocator);
+                defer help_text.deinit();
+                inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |field| {
+                    help_text.writer().print(" {s}\n", .{field.name}) catch break :help;
+                }
+                std.log.info("available architectures:\n{s} native\n", .{help_text.items});
+            }
+            fatal("unknown architecture: '{s}'", .{diags.unknown_architecture_name.?});
         },
         else => |e| fatal("unable to parse target query '{s}': {s}", .{
             opts.arch_os_abi, @errorName(e),
